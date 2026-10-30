@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>asw_description</name>
+  <version>0.1.0</version>
+  <description>LIMO Pro URDF (시뮬레이션/실차 공통, xacro 인자 sim)</description>
+  <maintainer email="tlsrhkr7@gmail.com">asw-team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

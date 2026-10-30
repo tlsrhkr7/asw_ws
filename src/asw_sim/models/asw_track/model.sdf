@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="asw_track">
+    <static>true</static>
+    <link name="mat">
+      <!-- 시각용 평면만. 충돌은 world의 ground_plane이 담당 -->
+      <visual name="track_visual">
+        <pose>0 0 0.0005 0 0 0</pose>
+        <cast_shadows>false</cast_shadows>
+        <geometry>
+          <mesh><uri>model://asw_track/meshes/track.dae</uri></mesh>
+        </geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>

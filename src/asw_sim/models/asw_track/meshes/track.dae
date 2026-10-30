@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset><unit name="meter" meter="1"/><up_axis>Z_UP</up_axis></asset>
+  <library_images>
+    <image id="track_png" name="track_png"><init_from>track.png</init_from></image>
+  </library_images>
+  <library_effects>
+    <effect id="track_effect">
+      <profile_COMMON>
+        <newparam sid="track_surface"><surface type="2D"><init_from>track_png</init_from></surface></newparam>
+        <newparam sid="track_sampler"><sampler2D><source>track_surface</source></sampler2D></newparam>
+        <technique sid="common">
+          <lambert>
+            <emission><color>0.15 0.15 0.15 1</color></emission>
+            <diffuse><texture texture="track_sampler" texcoord="UVMap"/></diffuse>
+          </lambert>
+        </technique>
+      </profile_COMMON>
+    </effect>
+  </library_effects>
+  <library_materials>
+    <material id="track_material" name="track_material"><instance_effect url="#track_effect"/></material>
+  </library_materials>
+  <library_geometries>
+    <geometry id="track_mesh" name="track_mesh">
+      <mesh>
+        <source id="track_pos">
+          <float_array id="track_pos_arr" count="12">0 0 0  8.5 0 0  8.5 8.5 0  0 8.5 0</float_array>
+          <technique_common><accessor source="#track_pos_arr" count="4" stride="3">
+            <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+          </accessor></technique_common>
+        </source>
+        <source id="track_nrm">
+          <float_array id="track_nrm_arr" count="3">0 0 1</float_array>
+          <technique_common><accessor source="#track_nrm_arr" count="1" stride="3">
+            <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+          </accessor></technique_common>
+        </source>
+        <source id="track_uv">
+          <float_array id="track_uv_arr" count="8">0 0  1 0  1 1  0 1</float_array>
+          <technique_common><accessor source="#track_uv_arr" count="4" stride="2">
+            <param name="S" type="float"/><param name="T" type="float"/>
+          </accessor></technique_common>
+        </source>
+        <vertices id="track_vtx"><input semantic="POSITION" source="#track_pos"/></vertices>
+        <triangles material="track_material" count="2">
+          <input semantic="VERTEX" source="#track_vtx" offset="0"/>
+          <input semantic="NORMAL" source="#track_nrm" offset="1"/>
+          <input semantic="TEXCOORD" source="#track_uv" offset="2" set="0"/>
+          <p>0 0 0  1 0 1  2 0 2   0 0 0  2 0 2  3 0 3</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="track" name="track">
+        <instance_geometry url="#track_mesh">
+          <bind_material><technique_common>
+            <instance_material symbol="track_material" target="#track_material">
+              <bind_vertex_input semantic="UVMap" input_semantic="TEXCOORD" input_set="0"/>
+            </instance_material>
+          </technique_common></bind_material>
+        </instance_geometry>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene><instance_visual_scene url="#Scene"/></scene>
+</COLLADA>

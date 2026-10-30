@@ -1,0 +1,219 @@
+<?xml version="1.0"?>
+<!--
+  AgileX LIMO Pro (Ackermann 모드). 시뮬레이션과 실차가 같은 URDF를 쓴다.
+    xacro limo_pro.urdf.xacro sim:=true   → Gazebo용 (바퀴/조향 관절, 센서·구동 플러그인 포함)
+    xacro limo_pro.urdf.xacro sim:=false  → 실차용 (센서 고정 프레임만. 바퀴 joint_states가 없으므로 바퀴 제외)
+
+  프레임 규약 (실차 LIMO 드라이버와 동일)
+    odom → base_link            : 오도메트리 (실차 asw_limo_base / 시뮬 wheel_odom)
+    base_link                    : 지면 위, 앞뒤 차축 가운데. x 전방, y 왼쪽, z 위
+    base_link → laser_link       : ydlidar_ros2_driver frame_id
+    base_link → camera_link      : orbbec_camera 의 기준 프레임 (camera_link 아래 광학 프레임은 실차에선 orbbec 드라이버가 발행)
+    base_link → imu_link         : LIMO 드라이버 /imu frame_id
+
+  치수 출처
+    - wheelbase 0.200, track 0.172, 최대 내측 조향 28도: LIMO 드라이버 상수 (wego_ws limo_base/limo_driver.h, 실차에서 확인)
+    - 바퀴 반경 0.045, 라이다 (0.103, 0.116), 카메라 (0.084, 0.18): AgileX limo_description URDF 기준
+  실측 필요 (줄자로 재고 아래 property만 수정)
+    - 카메라 높이/전후 위치/기울기, 라이다 위치, 바퀴 반경
+-->
+<robot name="limo_pro" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="sim" default="true"/>
+  <xacro:arg name="cam_pitch" default="0.0"/>       <!-- +면 아래를 봄 (rad) -->
+  <xacro:property name="sim" value="$(arg sim)"/>
+
+  <!-- ===== 주요 치수 ===== -->
+  <xacro:property name="PI" value="3.14159265"/>
+  <xacro:property name="wheelbase" value="0.200"/>
+  <xacro:property name="track" value="0.172"/>
+  <xacro:property name="wheel_r" value="0.045"/>
+  <xacro:property name="wheel_w" value="0.045"/>
+  <xacro:property name="max_inner_steer" value="0.48869"/>   <!-- 28 deg -->
+  <xacro:property name="body_l" value="0.322"/>
+  <xacro:property name="body_w" value="0.220"/>   <!-- LIMO Pro 스펙: 길이 322 x 폭 220 x 높이 251 mm, 4.8 kg -->
+
+  <xacro:property name="body_h" value="0.120"/>
+  <xacro:property name="body_z" value="0.130"/>             <!-- 지면 기준 차체 중심 높이 -->
+  <xacro:property name="body_mass" value="4.0"/>   <!-- 4.8 kg - 바퀴 4 x 0.2 kg -->
+  <xacro:property name="wheel_mass" value="0.2"/>
+
+  <!-- 센서 장착 (base_link = 지면 기준) -->
+  <xacro:property name="lidar_x" value="0.103"/>
+  <xacro:property name="lidar_z" value="0.116"/>
+  <xacro:property name="cam_x" value="0.084"/>
+  <xacro:property name="cam_z" value="0.180"/>
+  <xacro:property name="imu_z" value="0.050"/>
+
+  <!-- 시뮬레이션 센서 사양 (실차 설정과 맞춤) -->
+  <!-- 카메라: orbbec astra_stereo_u3.launch.py 기본값 640x480 30fps. hfov는 실차 camera_info fx로 확인 후 수정 -->
+  <xacro:property name="cam_hfov" value="1.185"/>
+  <!-- 라이다: wego_ws ydlidar.yaml  angle -110~110 deg, 10 Hz, sample_rate 4k → 0.9 deg 간격 -->
+  <xacro:property name="lidar_half_angle" value="1.91986"/>   <!-- 110 deg -->
+  <xacro:property name="lidar_samples" value="245"/>
+  <xacro:property name="lidar_max" value="12.0"/>
+
+  <material name="limo_gray"><color rgba="0.25 0.25 0.28 1"/></material>
+  <material name="tire"><color rgba="0.05 0.05 0.05 1"/></material>
+  <material name="sensor"><color rgba="0.1 0.3 0.8 1"/></material>
+
+  <!-- ===== 차체 ===== -->
+  <link name="base_link"/>
+
+  <link name="chassis_link">
+    <visual>
+      <geometry><box size="${body_l} ${body_w} ${body_h}"/></geometry>
+      <material name="limo_gray"/>
+    </visual>
+    <!-- 충돌 박스는 라이다(x=0.103)보다 뒤에서 끝나게 줄임: 라이다 레이가 차체 내부에서 시작하지 않도록 -->
+    <collision>
+      <origin xyz="-0.03 0 0"/>
+      <geometry><box size="0.20 0.18 ${body_h}"/></geometry>
+    </collision>
+    <inertial><mass value="${body_mass}"/>
+      <inertia ixx="${body_mass*(body_w*body_w+body_h*body_h)/12}" ixy="0" ixz="0"
+               iyy="${body_mass*(body_l*body_l+body_h*body_h)/12}" iyz="0"
+               izz="${body_mass*(body_l*body_l+body_w*body_w)/12}"/>
+    </inertial>
+  </link>
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/><child link="chassis_link"/>
+    <origin xyz="0 0 ${body_z}"/>
+  </joint>
+
+  <!-- ===== 센서 프레임 (실차/시뮬 공통) ===== -->
+  <link name="laser_link">
+    <visual><geometry><cylinder radius="0.03" length="0.03"/></geometry><material name="sensor"/></visual>
+    <inertial><mass value="0.05"/><inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/></inertial>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/><child link="laser_link"/>
+    <origin xyz="${lidar_x} 0 ${lidar_z}"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual><geometry><box size="0.02 0.09 0.025"/></geometry><material name="sensor"/></visual>
+    <inertial><mass value="0.05"/><inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/></inertial>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/><child link="camera_link"/>
+    <origin xyz="${cam_x} 0 ${cam_z}" rpy="0 $(arg cam_pitch) 0"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/><child link="imu_link"/>
+    <origin xyz="0 0 ${imu_z}"/>
+  </joint>
+
+  <!-- ================= 이하 시뮬레이션 전용 ================= -->
+  <xacro:if value="${sim}">
+
+  <!-- 실차에서는 orbbec 드라이버가 camera_link → camera_color_frame → camera_color_optical_frame 을 발행 -->
+  <link name="camera_color_optical_frame"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/><child link="camera_color_optical_frame"/>
+    <origin rpy="${-PI/2} 0 ${-PI/2}"/>
+  </joint>
+
+  <!-- 바퀴: 모양만 (고정 관절). 차체 이동은 아래 planar_move + asw_sim sim_vehicle 노드가 담당.
+       gazebo_ros_ackermann_drive(물리 기반)는 정지 명령 때 NaN으로 발산해서 쓰지 않음 (2026-10-27 확인) -->
+  <xacro:macro name="wheel" params="name x y">
+    <link name="${name}">
+      <visual>
+        <origin rpy="${PI/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+        <material name="tire"/>
+      </visual>
+      <collision>
+        <origin rpy="${PI/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+      </collision>
+      <inertial><mass value="${wheel_mass}"/>
+        <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+      </inertial>
+    </link>
+    <joint name="${name}_joint" type="fixed">
+      <parent link="base_link"/><child link="${name}"/>
+      <origin xyz="${x} ${y} ${wheel_r}"/>
+    </joint>
+    <!-- 마찰 0: planar_move 가 속도를 직접 정하므로 바퀴가 바닥에 걸리지 않게 -->
+    <gazebo reference="${name}"><mu1>0.0</mu1><mu2>0.0</mu2></gazebo>
+  </xacro:macro>
+  <xacro:wheel name="rear_left_wheel_link" x="${-wheelbase/2}" y="${track/2}"/>
+  <xacro:wheel name="rear_right_wheel_link" x="${-wheelbase/2}" y="${-track/2}"/>
+  <xacro:wheel name="front_left_wheel_link" x="${wheelbase/2}" y="${track/2}"/>
+  <xacro:wheel name="front_right_wheel_link" x="${wheelbase/2}" y="${-track/2}"/>
+
+  <!-- ===== Gazebo 플러그인 ===== -->
+  <gazebo reference="chassis_link"><material>Gazebo/DarkGrey</material></gazebo>
+
+  <gazebo>
+    <!-- 차체 속도 = sim_vehicle 노드가 계산한 (v, 요레이트). 조향 지연/가감속/자전거 모델은 sim_vehicle 에서.
+         odom 출력 = Gazebo 월드 실제 위치 = Ground Truth (world = map 좌표). TF는 발행하지 않음 -->
+    <plugin name="planar_move" filename="libgazebo_ros_planar_move.so">
+      <ros>
+        <remapping>cmd_vel:=/sim/body_twist</remapping>
+        <remapping>odom:=/ground_truth/odom</remapping>
+      </ros>
+      <update_rate>200</update_rate>
+      <publish_rate>50</publish_rate>
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>false</publish_odom_tf>
+      <odometry_frame>world</odometry_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+      <covariance_x>0.0</covariance_x><covariance_y>0.0</covariance_y><covariance_yaw>0.0</covariance_yaw>
+    </plugin>
+  </gazebo>
+
+  <gazebo reference="laser_link">
+    <sensor type="ray" name="lidar">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <visualize>false</visualize>
+      <ray>
+        <scan><horizontal><samples>${lidar_samples}</samples><resolution>1</resolution>
+          <min_angle>${-lidar_half_angle}</min_angle><max_angle>${lidar_half_angle}</max_angle></horizontal></scan>
+        <range><min>0.10</min><max>${lidar_max}</max><resolution>0.01</resolution></range>
+        <noise><type>gaussian</type><mean>0</mean><stddev>0.01</stddev></noise>
+      </ray>
+      <plugin name="lidar_plugin" filename="libgazebo_ros_ray_sensor.so">
+        <ros><remapping>~/out:=/scan</remapping></ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>laser_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="camera_link">
+    <sensor type="camera" name="color_camera">
+      <always_on>true</always_on>
+      <update_rate>30</update_rate>
+      <camera>
+        <horizontal_fov>${cam_hfov}</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.05</near><far>20</far></clip>
+        <noise><type>gaussian</type><mean>0</mean><stddev>0.005</stddev></noise>
+      </camera>
+      <plugin name="camera_plugin" filename="libgazebo_ros_camera.so">
+        <ros><namespace>/camera</namespace></ros>
+        <camera_name>color</camera_name>
+        <frame_name>camera_color_optical_frame</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="imu_link">
+    <sensor type="imu" name="imu">
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+        <ros><remapping>~/out:=/imu</remapping></ros>
+        <frame_name>imu_link</frame_name>
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  </xacro:if>
+</robot>

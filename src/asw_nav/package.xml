@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>asw_nav</name>
+  <version>0.1.0</version>
+  <description>경로 발행, Pure Pursuit(전진/후진), 궤적 기록 — 시뮬/실차 공통</description>
+  <maintainer email="tlsrhkr7@gmail.com">asw-team</maintainer>
+  <license>Apache-2.0</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>asw_limo_base</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <!-- 맵 마스크/텍스처는 asw_sim 패키지에서 실행 중에 찾는다 (lane_localizer, nav_viewer).
+       asw_sim 이 asw_bringup → asw_nav 를 의존하므로 여기에 asw_sim 을 적으면 순환 의존이 된다. -->
+
+  <exec_depend>python3-numpy</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

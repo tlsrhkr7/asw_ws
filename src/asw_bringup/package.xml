@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>asw_bringup</name>
+  <version>0.1.0</version>
+  <description>실차 LIMO 실행 launch 와 설정</description>
+  <maintainer email="tlsrhkr7@gmail.com">asw-team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>asw_description</exec_depend>
+  <exec_depend>asw_limo_base</exec_depend>
+  <exec_depend>asw_nav</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <!-- 실차(wego_ws)에만 있는 드라이버. 시뮬레이션 PC에서는 없어도 빌드는 된다 -->
+  <!-- ydlidar_ros2_driver, orbbec_camera -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

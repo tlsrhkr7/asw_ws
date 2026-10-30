@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.8)
+project(asw_sim)
+find_package(ament_cmake REQUIRED)
+install(DIRECTORY launch worlds models maps rviz DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/sim_vehicle.py scripts/track_marker.py scripts/spawn_objects.py scripts/spawn_person.py DESTINATION lib/${PROJECT_NAME})
+ament_package()

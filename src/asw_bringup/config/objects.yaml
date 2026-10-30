@@ -1,0 +1,95 @@
+# 대회 소품 배치 (좌표 = 맵 m: 트랙 왼쪽 아래 0,0 / x 오른쪽 / y 위, yaw [deg] 반시계)
+# 현장에서 바뀌면 이 파일만 고친다:
+#   시뮬: `asw_objects` → Gazebo 를 끄지 않고 다시 배치.  네비 창은 2초마다 이 파일을 다시 읽어 그린다.
+#   실차: deploy 하면 같은 파일이 올라감 (미션 코드가 '어디쯤 무엇이 있는지' 참고용)
+# 크기 출처: 작년(2025) 카페 Q&A (고국원 교수 답변). 올해 바뀌면 숫자만 수정.
+#
+# 좌표 찾기: 네비 창에서 d 키(디버그) → 마우스 커서 위치 좌표가 왼쪽 아래에 표시됨
+
+# 라이다 구간 종이컵 — 660ml: 높이 0.17 m, 지름 약 0.06 m (흰색)
+cups:
+  enabled: true
+  along_gray: true        # 회색 선(라이다 구간 중심선) 양옆에 자동 배치 (maps/gray_line.csv)
+  offset: 0.24            # 회색 선에서 컵 중심까지 [m] → 컵 사이 간격 = 2 x offset (차 폭 0.22)
+  spacing: 0.30           # 선을 따라 컵 간격 [m]
+  end_clear: 0.0          # 회색 선 양 끝에서 이 거리 안에는 안 놓음 (0 = 구간 처음부터 끝까지)
+  shift: 0.0              # 시험용: 컵 전체를 선 진행 방향 왼쪽(+)으로 [m] (실제 콘이 선 기준으로 안 놓인 경우)
+  jitter: 0.0             # 시험용: 컵마다 무작위 ± [m]
+  seed: 0
+  height: 0.17
+  radius: 0.03
+  extra: []               # 수동 추가 [[x, y], ...]
+  remove_near: []         # 자동 배치 중 이 점들 0.1 m 안의 컵 빼기 [[x, y], ...]
+
+# ===== 맵(시나리오) 선택 =====  1~4: 칸막이 4경우 × 추월 장애물 무작위 배치 (맵마다 고정 시드)
+#   시뮬: sim.launch scenario:=N 으로도 바꿀 수 있음 (이 값보다 우선)
+scenario: 1
+scenarios:
+  1: {rotary_blocked: bottom, final_blocked: left,  overtake_seed: 11}
+  2: {rotary_blocked: bottom, final_blocked: right, overtake_seed: 22}
+  3: {rotary_blocked: top,    final_blocked: left,  overtake_seed: 33}
+  4: {rotary_blocked: top,    final_blocked: right, overtake_seed: 44}
+
+# 칸막이 (신호등 대신, 2025 변경 규정): 동전 던지기로 막을 쪽을 정함 → 차는 안 막힌 쪽으로 주행
+#   3 로터리:      top = 원 위로 도는 길 막음 / bottom = 원 아래로 가는 길 막음 / none
+#   12 마지막 주정차: left = 위칸(좌회전) 막음 / right = 아래칸(우회전) 막음 / none
+# 차는 2번 정지선, 11번 정지선에서 멈춘 뒤 라이다로 places 위치를 보고 고른다 (missions.yaml decisions)
+# rotary_blocked / final_blocked 는 scenario 가 있으면 그 값으로 덮어씀
+partitions:
+  rotary_blocked: bottom
+  final_blocked: left
+  height: 0.30
+  thickness: 0.02
+  places:                 # yaw [deg]: 판의 두께 방향. 90 = 판이 x 방향으로 펼쳐짐(남북 차로를 가로막음)
+    rotary_top:    {x: 0.68, y: 3.20, yaw: 90, width: 0.40}
+    rotary_bottom: {x: 1.65, y: 2.77, yaw: 0, width: 0.40}
+    final_left:    {x: 7.61, y: 1.05, yaw: 90, width: 0.40}
+    final_right:   {x: 7.61, y: 0.45, yaw: 90, width: 0.40}
+
+# 아크릴 장애물 — 폭 0.20 m 이상, 높이 0.30 m 이상. 규칙: 앞에서 정지 → 팀원 1명이 치움
+# 위치: '3번 구간 이후, 경기날 공개' → 아래는 임시 위치 (위 S자 차로)
+obstacles:
+  - name: obstacle1
+    enabled: false        # 주행 미션(정지 대기) 구현 전까지 끔 → 켜면 차가 그대로 부딪힘
+    x: 2.70
+    y: 5.68
+    yaw: 0.0              # 판이 놓인 방향 (0 = 판 면이 x 축을 향함 → y 방향 차로를 가로막음)
+    width: 0.25
+    height: 0.30
+    thickness: 0.01
+
+# 추월 구간 정차 차량 — 모형차, 폭 0.20 m 이상, 높이 0.20 m 이상. 위치 랜덤 → 후보 중 pick 번째
+cars:
+  - name: parked_car1
+    enabled: false        # 추월 미션 구현 전까지 끔
+    candidates: [[3.60, 7.69], [4.60, 7.69], [5.60, 7.69]]   # 위쪽 2차로 구간 가운데 차로
+    pick: 1               # 0부터. -1 이면 실행할 때마다 무작위
+    yaw: 0.0
+    length: 0.30
+    width: 0.20
+    height: 0.20
+
+# 5 추월 구간 장애물 (임시): 종이컵 3개를 옆으로 붙인 덩어리 count 개. 3차로 중 무작위 차로, 앞뒤 간격 확보
+#   시나리오의 overtake_seed 로 배치가 정해짐 (같은 맵 번호면 항상 같은 배치). 차는 라이다로 찾아 피함
+overtake:
+  enabled: true
+  count: 2
+  lanes_y: [8.10, 7.69, 7.29]        # 3차로 중심 y (위/가운데/아래), 맵 그림 기준
+  # 장애물 i 의 x 범위. 3차로가 다 펼쳐진 곳은 x 3.3~5.5 (2.2 m) 뿐이고 차로 변경에 ~1.05 m 필요 →
+  # 4번 정지선 뒤에서 옮겨 타 첫 장애물 전에 끝나고, 마지막 장애물 뒤에서 돌아와 6번 정지선 전에 끝나는 범위
+  x_ranges: [[3.70, 3.90], [4.40, 4.65]]
+  cups_per_obstacle: 3
+  cup_gap: 0.06                      # 컵 중심 간격 = 지름 (붙여 놓음)
+  height: 0.17
+  radius: 0.03
+  seed: 0                            # scenario 의 overtake_seed 가 우선
+
+# 10 미로 구간 벽 — 높이 0.20 m 이상 (사진: 박스 통로 바깥 테두리 + 안쪽 블록 둘레를 흰 판으로 막음)
+# 선분 = 차선 위. 현장에서 다르면 좌표만 수정
+walls:
+  - {name: maze_outer_top,    x1: 3.67, y1: 2.42, x2: 1.47, y2: 2.42, height: 0.20, thickness: 0.02}
+  - {name: maze_outer_left,   x1: 1.47, y1: 2.42, x2: 1.47, y2: 0.42, height: 0.20, thickness: 0.02}
+  - {name: maze_outer_bottom, x1: 1.47, y1: 0.42, x2: 4.27, y2: 0.42, height: 0.20, thickness: 0.02}
+  - {name: maze_inner_top,    x1: 3.67, y1: 1.70, x2: 2.47, y2: 1.70, height: 0.20, thickness: 0.02}
+  - {name: maze_inner_left,   x1: 2.47, y1: 1.70, x2: 2.47, y2: 1.10, height: 0.20, thickness: 0.02}
+  - {name: maze_inner_bottom, x1: 2.47, y1: 1.10, x2: 4.27, y2: 1.10, height: 0.20, thickness: 0.02}

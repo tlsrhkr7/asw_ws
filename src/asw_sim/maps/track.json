@@ -1,0 +1,16 @@
+{
+  "size_m": 8.5,
+  "pixels": 4096,
+  "m_per_px": 0.0020751953125,
+  "line_width_m": 0.02,
+  "src": {
+    "w": 750,
+    "h": 749,
+    "m_per_px_x": 0.011333333333333334,
+    "m_per_px_y": 0.011348464619492658
+  },
+  "frame": "origin = map lower-left corner, x right, y up (image top = +y)",
+  "skeleton_px_gray": 759,
+  "skeleton_px_yellow": 6599,
+  "skeleton_px_white": 453
+}

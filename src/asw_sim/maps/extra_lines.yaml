@@ -1,0 +1,7 @@
+# 규정집 그림에는 없지만 실제 트랙에 있는 선 (맵 좌표 m: 트랙 왼쪽 아래 0,0 / x 오른쪽 / y 위)
+# 고친 뒤:  python3 fix_stop_lines.py  (track.png, track_lines_white.png 갱신) → asw_route → asw_build
+# 선 끝은 노란 차선까지 자동으로 늘어남 (fix_stop_lines.py). 위치는 실제 맵에서 줄자로 확인할 것.
+# 채점표 구간 번호 기준
+white:
+  - {name: "4 정지선-1 (추월 구간 입구)", x1: 2.40, y1: 7.50, x2: 2.40, y2: 7.90}
+  - {name: "6 정지선-2 (라바콘 회피 구간 입구)", x1: 6.90, y1: 7.50, x2: 6.90, y2: 7.90}

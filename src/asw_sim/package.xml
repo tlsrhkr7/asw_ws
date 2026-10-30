@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>asw_sim</name>
+  <version>0.1.0</version>
+  <description>IROC ASW 8.5m 트랙 + LIMO Pro 시뮬레이션 (planar_move + sim_vehicle)</description>
+  <maintainer email="tlsrhkr7@gmail.com">asw-team</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>asw_description</exec_depend>
+  <exec_depend>asw_limo_base</exec_depend>
+  <exec_depend>asw_bringup</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_plugins</exec_depend>
+  <exec_depend>gazebo_msgs</exec_depend>
+  <exec_depend>asw_nav</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+    <gazebo_ros gazebo_model_path="${prefix}/models"/>
+  </export>
+</package>
