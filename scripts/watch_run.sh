@@ -45,10 +45,15 @@ sleep 2
 LOG=$(ls -t ~/asw_logs/*_${PATH_NAME}.csv | head -1)
 echo "[watch] ===== 결과 ====="
 if [ "$PATH_NAME" = mission ]; then
-  python3 $ASW_REPO/src/asw_nav/scripts/check_mission.py "$LOG" ${SCENARIO:+--scenario $SCENARIO}
+  python3 $ASW_REPO/src/asw_nav/scripts/check_mission.py "$LOG" ${SCENARIO:+--scenario $SCENARIO} ${WARP:+--warp $WARP} ${RAND:+--randomize $RAND}
 else
   python3 $ASW_REPO/src/asw_nav/scripts/check_run.py "$LOG"
 fi
 python3 $ASW_REPO/scripts/plot_run.py "$LOG" 2>/dev/null | grep -E "duration|cte|odom vs|localizer"
+if [ -n "$HOLD" ]; then          # HOLD=초: 결과 화면을 그만큼 보여 준 뒤 종료 (여러 맵 연속 실행용)
+  echo "[watch] ${HOLD}초 뒤 종료"
+  sleep "$HOLD"; kill -INT $DP $SP 2>/dev/null; sleep 3; bash $ASW_REPO/scripts/sim_clean.sh > /dev/null
+  exit 0
+fi
 echo "[watch] 창은 그대로 둡니다. 끝내려면 Ctrl-C"
 wait $DP

@@ -92,7 +92,7 @@ def overtake_obstacles(o):
     return out
 
 
-def load(path=None, rng=None, scenario=None):
+def load(path=None, rng=None, scenario=None, randomize=None):
     cfg = load_cfg(path, scenario)
     rng = rng or random.Random()
     out = []
@@ -143,4 +143,59 @@ def load(path=None, rng=None, scenario=None):
         out.append({"kind": "box", "name": o["name"], "x": (x1 + x2) / 2, "y": (y1 + y2) / 2,
                     "yaw": math.atan2(y2 - y1, x2 - x1), "length": math.hypot(x2 - x1, y2 - y1),
                     "width": o.get("thickness", 0.02), "height": o.get("height", 0.20), "role": "wall"})
+    if randomize:
+        out = randomize_objects(out, int(randomize))
+    return out
+
+
+def random_partition(o, rnd):
+    """갈림길 칸막이를 실제로 올 수 있는 여러 종류로: 판 / 작은 상자 여러 개 / 깊이 다른 판 (컵은 라바콘 구간에만).
+    칸막이 상자: length = 두께(차로 방향, yaw), width = 차로를 가로지르는 폭."""
+    u = rnd.uniform
+    kind = rnd.choice(["board", "boxes", "deep"])
+    ca, sa = math.cos(o["yaw"]), math.sin(o["yaw"])          # 차로 방향
+    cx, cy = o["x"] + u(-0.08, 0.08), o["y"] + u(-0.08, 0.08)
+    if kind == "deep":                                       # 갈림길 안쪽/입구 쪽으로 최대 25 cm
+        d = u(-0.25, 0.25)
+        cx, cy = cx + ca * d, cy + sa * d
+    yaw = o["yaw"] + math.radians(u(-10, 10))
+    base = {"name": o["name"], "role": "partition", "yaw": yaw}
+    if kind in ("board", "deep"):
+        return [dict(base, kind="box", x=cx, y=cy, length=u(0.01, 0.05), width=u(0.25, 0.50), height=u(0.15, 0.35))]
+    span = u(0.25, 0.40)                                     # 차로를 가로지르는 범위
+    n = rnd.randint(2, 3)
+    out = []
+    for i in range(n):                                       # 작은 상자 여러 개를 띄엄띄엄
+        t = (i / (n - 1) - 0.5) * span
+        x, y = cx - math.sin(yaw) * t, cy + math.cos(yaw) * t
+        sz = u(0.06, 0.15)
+        out.append(dict(base, name=f"{o['name']}_{i}", kind="box", x=x, y=y, length=sz, width=sz,
+                        height=u(0.15, 0.30)))
+    return out
+
+
+def randomize_objects(objs, seed):
+    """시험용: 소품 크기·위치를 실제와 다를 수 있는 만큼 무작위로 바꿈 (우리가 만든 소품은 실제와 100% 다름).
+    컵 높이는 라이다 스캔 높이(0.116 m)보다 높은 범위만 — 낮으면 라이다가 아예 못 봄 (실측 확인 항목)."""
+    rnd = random.Random(seed)
+    u = rnd.uniform
+    out = []
+    for o in objs:
+        o = dict(o)
+        role = o.get("role", o["kind"])
+        if o["kind"] == "cup":
+            o["x"] += u(-0.03, 0.03)
+            o["y"] += u(-0.03, 0.03)
+            o["radius"] = u(0.025, 0.045)
+            o["height"] = u(0.12, 0.17)
+        elif role == "partition":
+            out += random_partition(o, rnd)
+            continue
+        elif role == "wall":                     # 벽마다 옆으로 ±5 cm (선 위가 아니라 차선 안쪽으로 들어온 경우 포함)
+            sh = u(-0.05, 0.05)
+            o["x"] -= math.sin(o["yaw"]) * sh
+            o["y"] += math.cos(o["yaw"]) * sh
+            o["width"] = u(0.01, 0.04)
+            o["height"] = u(0.15, 0.30)
+        out.append(o)
     return out

@@ -18,7 +18,7 @@ sys.path.insert(0, HERE)
 from make_route import N, SIZE_M, load_masks, long_white  # noqa: E402
 from plan_parking import BODY0  # noqa: E402
 
-from asw_nav import objects_io  # noqa: E402
+from asw_nav import objects_io, world_warp  # noqa: E402
 
 
 def body_xy(x, y, yaw):
@@ -47,12 +47,19 @@ def main():
     ap.add_argument("log", nargs="?")
     ap.add_argument("--scenario")
     ap.add_argument("--objects", help="objects.yaml 대신 (시험용 소품 파일)")
+    ap.add_argument("--randomize", type=int, default=0, help="sim.launch randomize:= 시드 (같은 소품으로 평가)")
+    ap.add_argument("--warp", help="틀린 맵 시험(sim.launch warp:=) 이름: 실제 위치를 맵 좌표로 되돌려 평가")
     a = ap.parse_args()
     log = a.log or sorted(glob.glob(os.path.expanduser("~/asw_logs/*.csv")))[-1]
     rows = [r for r in csv.DictReader(open(log, encoding="utf-8")) if r["gt_x"] != "nan"]
+    w = world_warp.load(a.warp)
+    if w is not None:      # 세계(변형된 트랙) 위치 → 맵 좌표: 맵 선·소품(맵 좌표)과 비교
+        for r in rows:
+            x, y, yaw = w.pose_inv(float(r["gt_x"]), float(r["gt_y"]), float(r["gt_yaw"]))
+            r["gt_x"], r["gt_y"], r["gt_yaw"] = str(x), str(y), str(yaw)
     m = load_masks()
     masks = {"노랑": m["yellow"] > 0, "흰선": long_white(m["white"]) > 0}
-    objs = objects_io.load(a.objects, scenario=a.scenario)
+    objs = objects_io.load(a.objects, scenario=a.scenario, randomize=a.randomize)
     with open(os.path.join(HERE, "..", "..", "asw_bringup", "config", "missions.yaml"), encoding="utf-8") as f:
         ov = yaml.safe_load(f)["overtake"]
     ly = ov["lanes_y"]
@@ -76,7 +83,7 @@ def main():
                 events.append([kind, name, t, t, x, y, 1])
 
     last = rows[-1]
-    print(f"{os.path.basename(log)} (맵 {a.scenario or '기본'}): {float(last['t']):.0f}s, "
+    print(f"{os.path.basename(log)} (맵 {a.scenario or '기본'}{', 틀린 맵 ' + a.warp if a.warp else ''}): {float(last['t']):.0f}s, "
           f"최종 ({float(last['gt_x']):.3f}, {float(last['gt_y']):.3f}, {math.degrees(float(last['gt_yaw'])):.0f}°)")
     for kind, name, t0, t1, x, y, n in events:
         print(f"  {kind} {name}: t={t0:.1f}~{t1:.1f}s at ({x:.2f}, {y:.2f}), {n} 샘플")

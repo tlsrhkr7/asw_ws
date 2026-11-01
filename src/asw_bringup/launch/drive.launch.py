@@ -49,7 +49,8 @@ def nodes(context):
         planner,
         Node(package="asw_nav", executable="pure_pursuit", output="screen",
              parameters=[common, {"speed": float(lc("speed")), "reverse_speed": float(lc("reverse_speed")),
-                                  "lookahead_min": float(lc("lookahead")), "wait_localizer": init_align}]),
+                                  "lookahead_min": float(lc("lookahead")), "wait_localizer": init_align,
+                                  "lane_centering": lc("lane_centering").lower() == "true"}]),
         # 정지선 검출 (카메라): 실제 선 앞에 서기 + 정지선 순서로 구간 판단
         Node(package="asw_nav", executable="stopline_detector", output="screen", parameters=[common]),
         Node(package="asw_nav", executable="trail_recorder", output="screen",
@@ -76,6 +77,8 @@ def generate_launch_description():
         DeclareLaunchArgument("scenario", default_value="", description="네비 창에 그릴 소품 시나리오(맵 1~4). 시뮬과 같게"),
         DeclareLaunchArgument("localizer", default_value="true",
                               description="true: 카메라-맵 매칭으로 위치 보정 / false: 오도메트리만 (map→odom 고정)"),
+        DeclareLaunchArgument("lane_centering", default_value="true",
+                              description="카메라로 본 실제 차선 가운데로 경로 옮기기 (맵이 실제와 다를 때)"),
         DeclareLaunchArgument("init_align", default_value="true",
                               description="출발 전 카메라로 놓인 자리 맞추기 (끝날 때까지 출발 안 함). false: 프리셋 그대로 출발"),
         DeclareLaunchArgument("viewer", default_value="true",

@@ -25,6 +25,12 @@
   안 되면 /localizer/init 에 이유를 내고 계속 다시 시도 (차를 다시 놓으면 됨).
   차선은 일정 간격(0.4 m)으로 되풀이되므로, 크게 잘못 놓으면 옆 차선 모양에 '잘 맞는다'고 착각할 수 있다
   → 프리셋에서 init_max_shift / init_max_turn 넘게 옮겨야 맞는 경우는 출발 안 함 (다시 놓기).
+/lane/points (sensor_msgs/PointCloud, odom): 차선 점(노랑·흰, 회색 제외)을 그대로 냄 → pure_pursuit 차선 가운데 맞추기
+  (맵이 실제 트랙과 달라도 실제로 보이는 차선 안으로 가게)
+기동 중(/pp/maneuver: 주차·주정차 짧은 구간, 후진)에는 움직이는 동안 보정을 쉰다 (오도메트리만). 칸 안은 선이
+  적고 가까이 붙어 엉뚱한 선에 맞추기 쉬워서, 잘못 맞추면 차가 움직이는 만큼 위치를 끌고 감.
+  대신 멈춰 있을 때(전진·후진 바꾸는 사이) 한 번, 좁게(±still_search_xy) 찾아 아주 잘 맞으면 한 번에 반영
+  (서 있으면 끌고 갈 수 없음. T 줄기 끝처럼 양옆·끝 선이 다 보이는 곳에서 맵과 실제 차이를 바로잡음).
 잘 되는지 판단: 점이 맵 선 위에 겹치고 점수(선 점과 맵 선 평균 거리)가 1cm 안팎이면 위치가 맞는 것.
 """
 import math
@@ -34,11 +40,12 @@ import cv2
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import Point32, TransformStamped, Vector3
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud
 from std_msgs.msg import Bool, Float32MultiArray, String
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
@@ -61,6 +68,12 @@ class LaneLocalizer(Node):
         p("enable", True)             # false 면 map→odom 을 초기값으로 고정 발행만 (기존 정적 TF 와 같음)
         p("rate", 10.0)               # 매칭 주기 [Hz]
         p("gain", 0.3)                # 한 번에 반영할 보정 비율
+        p("still_search_xy", 0.05)    # 기동 중 멈췄을 때 다시 맞추기: 찾는 범위 [m]
+        p("still_search_yaw", 3.0)    # [deg]
+        p("still_max_cost", 0.015)    # 이만큼 잘 맞을 때만 [m]
+        p("still_min_inlier", 0.7)
+        p("max_step_xy", 0.01)        # 한 번에 옮기는 위치 최대 [m] (10 Hz → 10 cm/s: 잘못 맞춘 선이 차를 따라
+        p("max_step_yaw", 0.3)        #  위치를 끌고 가는 것보다 차가 빠르게) / 방향 최대 [deg]
         p("search_xy", 0.08)          # [m]
         p("search_yaw", 4.0)          # [deg]
         p("max_dist", 0.05)           # 맵 선까지 거리 자르기 [m]
@@ -120,6 +133,7 @@ class LaneLocalizer(Node):
         self.pub_info = self.create_publisher(Float32MultiArray, "/localizer/info", 10)       # 매칭 점수·보정량 (로그)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_ready = self.create_publisher(Bool, "/localizer/ready", latched)
+        self.pub_lane = self.create_publisher(PointCloud, "/lane/points", 5)
         self.pub_init = self.create_publisher(String, "/localizer/init", latched)          # 네비 창 표시용 (영문)
         self.pub_ready.publish(Bool(data=self.ready))
         if not self.ready:
@@ -128,6 +142,11 @@ class LaneLocalizer(Node):
         self.scan = None
         self.create_subscription(LaserScan, "/scan", lambda m_: setattr(self, "scan", m_), qos_profile_sensor_data)
         self.create_subscription(CameraInfo, "/camera/color/camera_info", self.on_info, 5)
+        self.create_subscription(Vector3, "/localizer/shift", self.on_shift, 10)
+        self.maneuver = False
+        self.speed, self.still_since, self.still_fixed = 0.0, None, False
+        self.create_subscription(Odometry, "/odom", self.on_odom, 20)
+        self.create_subscription(Bool, "/pp/maneuver", lambda m_: setattr(self, "maneuver", m_.data), 10)
         self.create_subscription(Image, "/camera/color/image_raw", lambda m_: setattr(self, "img", m_),
                                  qos_profile_sensor_data)
         self.create_timer(0.02, self.publish_tf)                   # map→odom 50 Hz
@@ -173,11 +192,11 @@ class LaneLocalizer(Node):
         if g("use_gray"):
             gv = g("gray_v")
             m |= (s < g("gray_s_max")) & (v > gv[0]) & (v < gv[1])
-        x, y = gx[m], gy[m]
+        x, y, lane = gx[m], gy[m], (yellow | white)[m]
         if g("use_lidar_mask"):
             keep = self.not_behind_objects(x, y)
-            x, y = x[keep], y[keep]
-        return x, y
+            x, y, lane = x[keep], y[keep], lane[keep]
+        return x, y, lane
 
     def not_behind_objects(self, x, y):
         """라이다가 물체를 본 방향(1도 단위)에서 그 물체 밑동보다 먼 바닥 점 = 물체 몸통 또는 그 뒤 → 버림."""
@@ -224,13 +243,14 @@ class LaneLocalizer(Node):
                 return
         bx, by = tf.transform.translation.x, tf.transform.translation.y
         byaw = yaw_of(tf.transform.rotation)
-        px, py = self.line_points(msg)
+        px, py, lane = self.line_points(msg)
         # 맵(트랙 판) 밖 바닥은 버림: 판 밖 바닥(회색 콘크리트 등)이 회색/흰 선으로 잡히는 것 방지
         c, s_ = math.cos(byaw), math.sin(byaw)
         mgn = self.g("map_margin")
         wx, wy = bx + c * px - s_ * py, by + s_ * px + c * py
         inside = (wx > mgn) & (wx < SIZE_M - mgn) & (wy > mgn) & (wy < SIZE_M - mgn)
-        px, py = px[inside], py[inside]
+        px, py, lane = px[inside], py[inside], lane[inside]
+        self.publish_lane(msg, px[lane], py[lane])
         if len(px) < self.g("min_points"):
             self.publish_info(float("nan"), float("nan"), len(px), 0.0, 0.0, 0.0, False)
             self.status(f"skip points={len(px)}")
@@ -244,8 +264,16 @@ class LaneLocalizer(Node):
         mx = bx + c * px - s_ * py                                 # 현재 추정으로 맵에 올린 점
         my = by + s_ * px + c * py
         # 보정 후보: 차 위치를 중심으로 회전 dth + 평행이동 (dx, dy)
-        sx, syaw = ((self.g("init_search_xy"), math.radians(self.g("init_search_yaw"))) if init
-                    else (self.g("search_xy"), math.radians(self.g("search_yaw"))))
+        still_fix = (not init) and self.maneuver and self.still_now() and not self.still_fixed
+        if (not init) and self.maneuver and not still_fix:      # 기동 중 움직이는 동안: 보정 쉼
+            self.status("hold (기동 중)")
+            return
+        if init:
+            sx, syaw = self.g("init_search_xy"), math.radians(self.g("init_search_yaw"))
+        elif still_fix:
+            sx, syaw = self.g("still_search_xy"), math.radians(self.g("still_search_yaw"))
+        else:
+            sx, syaw = self.g("search_xy"), math.radians(self.g("search_yaw"))
         pen_w = self.g("init_penalty") if init else self.g("penalty")
         dxy = np.arange(-sx, sx + 1e-9, 0.01)
         dths = np.arange(-syaw, syaw + 1e-9, math.radians(1.0))
@@ -284,6 +312,15 @@ class LaneLocalizer(Node):
             self.publish_info(base, cost, len(px), ddx, ddy, dth, False)
             self.init_step(bx, by, ddx, ddy, dth, cost, inlier, len(px))
             return
+        if still_fix:                                            # 기동 중 멈춤: 아주 잘 맞으면 한 번에
+            self.still_fixed = True
+            if cost <= self.g("still_max_cost") and inlier >= self.g("still_min_inlier") and base - cost > 0.002:
+                self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
+                self.apply(bx, by, ddx, ddy, dth, 1.0)
+                self.status(f"still-fix dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg")
+            else:
+                self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+            return
         if cost > self.g("max_cost") or inlier < self.g("min_inlier"):
             self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
             self.status(f"reject points={len(px)} cost={cost * 100:.1f}cm inlier={inlier:.0%}")
@@ -293,9 +330,32 @@ class LaneLocalizer(Node):
             self.status(f"keep points={len(px)} cost={base * 100:.1f}cm")
             return
         self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
-        self.apply(bx, by, ddx, ddy, dth, self.g("gain"))
+        gn = self.g("gain")
+        sxy = math.hypot(ddx, ddy) * gn
+        if sxy > self.g("max_step_xy"):
+            gn *= self.g("max_step_xy") / sxy
+        dth_lim = math.radians(self.g("max_step_yaw"))
+        if abs(dth * gn) > dth_lim:
+            dth = math.copysign(dth_lim / gn, dth)
+        self.apply(bx, by, ddx, ddy, dth, gn)
         self.status(f"corr dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg "
                     f"points={len(px)} cost {base * 100:.1f}->{cost * 100:.1f}cm")
+
+    def on_odom(self, m):
+        self.speed = abs(m.twist.twist.linear.x)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.speed < 0.005:
+            self.still_since = self.still_since or now
+        else:
+            self.still_since, self.still_fixed = None, False
+
+    def still_now(self, hold=0.4):
+        return self.still_since is not None and self.get_clock().now().nanoseconds * 1e-9 - self.still_since > hold
+
+    def on_shift(self, m):
+        """다른 노드가 확인한 위치 보정 (정지선 앞 정차 → 앞뒤): 차 추정 위치를 맵에서 (x, y) 만큼 옮김."""
+        self.corr = np.array([self.corr[0] + m.x, self.corr[1] + m.y, self.corr[2]])
+        self.status(f"shift dx={m.x * 100:+.1f}cm dy={m.y * 100:+.1f}cm (정지선)")
 
     def apply(self, bx, by, ddx, ddy, dth, gn):
         """맵 좌표에서 차 위치 기준 (dth, ddx, ddy) × gn 만큼 옮기는 보정 → map→odom 에 합성."""
@@ -363,6 +423,25 @@ class LaneLocalizer(Node):
 
     def status(self, s):
         self.pub_status.publish(String(data=s))
+
+    def publish_lane(self, msg, x, y, n_max=400):
+        """차선 점(차 기준) → odom 좌표 PointCloud (영상 시각의 차 위치로)."""
+        try:
+            t = self.tfb.lookup_transform("odom", "base_link", Time.from_msg(msg.header.stamp))
+        except Exception:  # noqa: BLE001
+            try:
+                t = self.tfb.lookup_transform("odom", "base_link", Time())
+            except Exception:  # noqa: BLE001
+                return
+        k = max(1, len(x) // n_max)
+        x, y = x[::k], y[::k]
+        yaw = yaw_of(t.transform.rotation)
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        ox, oy = t.transform.translation.x + c * x - s_ * y, t.transform.translation.y + s_ * x + c * y
+        out = PointCloud()
+        out.header.stamp, out.header.frame_id = msg.header.stamp, "odom"
+        out.points = [Point32(x=float(a), y=float(b), z=0.0) for a, b in zip(ox, oy)]
+        self.pub_lane.publish(out)
 
     def publish_points(self, mx, my, n_max=300):
         """매칭에 쓴 선 점 (보정 전 추정 위치로 맵에 올린 것). 맵 선 위에 겹쳐 있으면 위치가 맞는 것."""

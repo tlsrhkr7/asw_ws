@@ -9,6 +9,7 @@
 카메라는 차 중심 앞 range_min 부터 보므로 서기 직전에는 선이 안 보임 → odom 좌표로 내서
 pure_pursuit 가 바퀴로 잰 이동 거리로 남은 거리를 계산하게 한다.
 
+흰 가로선(정지선)과 노란 가로선(마지막 주정차 칸 끝 선 등)을 따로 찾는다: point.z = 0 흰, 1 노랑.
 출력: /stopline (geometry_msgs/PointStamped, frame odom: 차 진행 방향 위의 선 중심 점), /stopline/status (글)
 """
 import math
@@ -41,16 +42,20 @@ class StoplineDetector(Node):
         p("band_half", 0.15)          # 차로 가운데 이 폭 [m] 안의 점만 (정지선은 차로를 가로질러 그어짐)
         p("band_thick", 0.04)         # 선 두께로 볼 범위 [m] (실제 20~50 mm + 기울기)
         p("min_coverage", 0.6)        # 좌우 몇 % 를 덮어야 가로선
-        p("max_angle", 12.0)          # 차와 선의 각도 [deg] 까지 찾음
+        p("max_angle", 25.0)          # 차와 선의 각도 [deg] 까지 찾음 (주정차 칸처럼 꺾어 들어가며 볼 때)
         p("confirm_dist", 0.04)       # 연속 두 장이 이 안에서 같은 곳이어야 확정 [m]
         p("pixel_step", 2)
         p("white_s_max", 50)          # 흰색 HSV (lane_localizer 와 같은 기준, 현장에서 다시 맞춤)
         p("white_v_min", 170)
+        p("yellow_h", [15, 40])       # 노란색 HSV (lane_localizer 와 같은 기준)
+        p("yellow_s_min", 80)
+        p("yellow_v_min", 100)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.g = g
         self.tfb = Buffer()
         TransformListener(self.tfb, self)
-        self.info, self.img, self.lut, self.prev, self.last_stamp = None, None, None, None, None
+        self.info, self.img, self.lut, self.last_stamp = None, None, None, None
+        self.prev = {0: None, 1: None}                   # 색마다 바로 전 후보 (연속 두 장 확인)
         self.create_subscription(CameraInfo, "/camera/color/camera_info", lambda m: setattr(self, "info", m), 5)
         self.create_subscription(Image, "/camera/color/image_raw", lambda m: setattr(self, "img", m),
                                  qos_profile_sensor_data)
@@ -77,34 +82,42 @@ class StoplineDetector(Node):
             self.lut = (vs, us, gx, gy)
         vs, us, gx, gy = self.lut
         hsv = cv2.cvtColor(np.ascontiguousarray(ground_proj.image_bgr(msg)), cv2.COLOR_BGR2HSV)
-        s, v = hsv[vs, us, 1], hsv[vs, us, 2]
-        white = (s < self.g("white_s_max")) & (v > self.g("white_v_min"))
-        dist = self.find_line(gx[white], gy[white])
-        if dist is None:
-            self.prev = None
-            return
-        try:
-            t = self.tfb.lookup_transform("odom", "base_link", Time.from_msg(msg.header.stamp))
-        except Exception:  # noqa: BLE001
-            try:
-                t = self.tfb.lookup_transform("odom", "base_link", Time())
-            except Exception:  # noqa: BLE001
-                return
-        yaw = yaw_of(t.transform.rotation)
-        ox = t.transform.translation.x + dist * math.cos(yaw)
-        oy = t.transform.translation.y + dist * math.sin(yaw)
-        ok = self.prev is not None and math.hypot(ox - self.prev[0], oy - self.prev[1]) < self.g("confirm_dist")
-        self.prev = (ox, oy)
-        if not ok:
-            return
-        out = PointStamped()
-        out.header.stamp, out.header.frame_id = msg.header.stamp, "odom"
-        out.point.x, out.point.y = ox, oy
-        self.pub.publish(out)
-        self.pub_status.publish(String(data=f"정지선 앞 {dist:.2f} m"))
+        h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
+        yh = self.g("yellow_h")
+        masks = {0: (s < self.g("white_s_max")) & (v > self.g("white_v_min")),
+                 1: (h > yh[0]) & (h < yh[1]) & (s > self.g("yellow_s_min")) & (v > self.g("yellow_v_min"))}
+        t = None
+        for color, m in masks.items():
+            found = self.find_line(gx[m], gy[m])
+            if found is None:
+                self.prev[color] = None
+                continue
+            if t is None:
+                try:
+                    t = self.tfb.lookup_transform("odom", "base_link", Time.from_msg(msg.header.stamp))
+                except Exception:  # noqa: BLE001
+                    try:
+                        t = self.tfb.lookup_transform("odom", "base_link", Time())
+                    except Exception:  # noqa: BLE001
+                        return
+            yaw = yaw_of(t.transform.rotation)
+            dist, ang = found
+            # 선에 내린 수선의 발 (차가 선과 비스듬해도, 나중에 바로 섰을 때 거리가 맞게)
+            ox = t.transform.translation.x + dist * math.cos(yaw + ang)
+            oy = t.transform.translation.y + dist * math.sin(yaw + ang)
+            pv = self.prev[color]
+            ok = pv is not None and math.hypot(ox - pv[0], oy - pv[1]) < self.g("confirm_dist")
+            self.prev[color] = (ox, oy)
+            if not ok:
+                continue
+            out = PointStamped()
+            out.header.stamp, out.header.frame_id = msg.header.stamp, "odom"
+            out.point.x, out.point.y, out.point.z = ox, oy, float(color)
+            self.pub.publish(out)
+            self.pub_status.publish(String(data=f"{'노란' if color else '흰'} 가로선 앞 {dist:.2f} m"))
 
     def find_line(self, x, y):
-        """가장 가까운 가로선까지 앞 거리 [m] (차 중심 기준, 차 진행축 위). 없으면 None."""
+        """가장 가까운 가로선 → (차 중심에서 선까지 수직 거리 [m], 선 수직 방향의 차 기준 각도 [rad]). 없으면 None."""
         if len(x) < 20:
             return None
         hb, th = self.g("band_half"), self.g("band_thick")
@@ -125,7 +138,7 @@ class StoplineDetector(Node):
                 cum[k:k + nb] |= occ
             cov = cum[:nb].mean(axis=1)
             hit = np.where(cov >= self.g("min_coverage"))[0]
-            if len(hit):
+            if len(hit) and abs(ang) < math.radians(self.g("max_angle")) - 1e-6:   # 각도 한계에 붙은 건 비스듬한 옆 선
                 i = hit[0]                                       # 두께 창 [i-w+1, i] 안에 선이 있음
                 a0, a1 = lo + (i - w + 1) * 0.01, lo + (i + w + 1) * 0.01
                 sel = (xr >= a0) & (xr < a1)
@@ -133,8 +146,8 @@ class StoplineDetector(Node):
                 c = float(cov[i:i + w].max())
                 # 가장 가까운 선 중에서 좌우를 가장 잘 덮는 각도 (= 선과 맞는 각도)의 거리
                 if best is None or d < best[0] - 0.05 or (abs(d - best[0]) <= 0.05 and c > best[1]):
-                    best = (d, c)
-        return best[0] if best else None
+                    best = (d, c, float(ang))
+        return (best[0], best[2]) if best else None
 
 
 def main():

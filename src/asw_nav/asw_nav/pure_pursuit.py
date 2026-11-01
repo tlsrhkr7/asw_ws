@@ -12,12 +12,21 @@
   safety_min_points 개 이상이면 정지, safety_clear 초 동안 비어 있으면 다시 출발 (사람·예상 못한 장애물).
   직선 상자가 아니라 경로를 따라가는 띠 → 곡선·라바콘 구간·옆 차로 장애물에서 헛정지 안 함.
   후진은 라이다(전방 ±110°)로 못 봄 → 후진 구간(주차)은 확인 못 함.
-라바콘 구간(맵의 회색 선 근처): 콘 위치는 미리 모름 → 라이다 점을 경로 기준 왼쪽/오른쪽으로 나눠
+라바콘 구간(맵의 회색 선 근처)·미로(lidar_zones): 콘·벽 위치는 미리 모름 → 라이다 점을 경로 기준 왼쪽/오른쪽으로 나눠
   가장 가까운 왼쪽 콘과 오른쪽 콘의 가운데로 경로를 옆으로 옮김 (cone_max_shift 까지, 부드럽게).
   한쪽만 보이면 그쪽에서 cone_gap 만큼 떨어지게. 안전 정지 띠도 옮긴 경로 기준 + 폭 cone_safety_half_width.
+차선 가운데 맞추기 (맵이 실제 트랙과 다를 때): lane_localizer 가 낸 실제 차선 점(/lane/points)을 경로 기준
+  왼쪽/오른쪽으로 나눠, 실제 차선 가운데로 앞쪽 경로를 옆으로 옮긴다 (lane_max_shift 까지, 부드럽게).
+  양쪽 선 간격이 차선 폭에 맞을 때만 (정지선·가로지르는 점선·반사 무시). 한쪽만 보이면 그 선에서 반폭.
+  기동 구간(주차·마지막 정차, 짧은 구간), 후진, 라바콘 구간에서는 안 함.
+주행 거리 감시: 위치 추정과 상관없이 바퀴 오도메트리(odom→base_link)로 구간마다 실제로 간 거리를 잰다.
+  구간 길이 × overrun_ratio + overrun_margin 을 넘으면 위치 추정이 이상한 것 → 그 구간을 끝냄 (마지막이면 정지).
+  (위치 보정이 차를 따라 위치를 끌고 가면, 차는 목표에 못 갔다고 생각하고 한없이 달려 나갈 수 있음)
 정지선: 정지선 정차 구간(다음 구간 앞이 ±3)이 끝나 갈 때 stopline_detector 가 찾은 실제 선(/stopline, odom)이
   맵 기준 정차 위치와 stopline_tol 안이면 실제 선 앞(stopline_offset)에 선다 (맵과 실제 트랙 차이 흡수).
-  선을 못 보면 맵 기준. 정차할 때마다 /pp/stop_event (JSON: 몇 번째, 카메라/맵, 맵과 차이) → mission_manager 구간 판단.
+  선을 못 보면 맵 기준. 카메라로 섰으면 '맵의 정차 지점 - 지금 추정 위치' 의 앞뒤 차이를 /localizer/shift 로 보내
+  위치 추정을 바로잡는다 (곧은 차로에서는 선으로 앞뒤를 못 맞춰 쌓이던 오차를 정지선마다 초기화).
+  정차할 때마다 /pp/stop_event (JSON: 몇 번째, 카메라/맵, 맵과 차이) → mission_manager 구간 판단.
 """
 import json
 import math
@@ -25,12 +34,12 @@ import os
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Vector3
 from nav_msgs.msg import Path
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud
 from rclpy.time import Time
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Bool, Float32, String
@@ -71,6 +80,7 @@ class PurePursuit(Node):
         p("safety_clear", 1.0)       # 비고 나서 이만큼 [s] 지나야 출발
         p("cone_centering", True)    # 라바콘 구간 라이다 가운데 맞추기
         p("cone_zone_dist", 0.15)    # 회색 선(맵)에서 이 거리 안이면 라바콘 구간 [m]
+        p("lidar_zones", [1.40, 4.35, 0.35, 2.50])   # 라이다 가운데 맞추기 상자 [x0 x1 y0 y1 ...] (맵의 10 미로 구간)
         p("cone_pre", 0.8)           # 앞으로 갈 경로 이 거리 안이 라바콘 구간이면 미리 시작 [m] (넉넉하게)
         p("cone_max_shift", 0.12)    # 경로를 옆으로 옮기는 최대 [m]
         p("cone_gap", 0.21)          # 한쪽 콘만 보일 때 그 콘에서 떨어질 거리 [m] (콘 반지름 포함 차 반폭 + 여유)
@@ -79,11 +89,26 @@ class PurePursuit(Node):
         p("cone_line_clear", 0.14)   # 옮긴 경로에서 차 중심 ~ 맵 노란 선 최소 거리 [m] (차 반폭 0.11 + 3 cm)
         p("cone_line_look", 0.8)     # 이 거리 [m] 앞 경로까지 선 여유 확인 (차가 따라오는 동안 선 안 넘게)
         p("cone_safety_half_width", 0.13)   # 라바콘 구간 안전 정지 띠 반폭 (차 반폭 0.11 + 2 cm)
+        p("lane_centering", True)    # 카메라로 본 실제 차선 가운데로 경로 옮기기
+        p("lane_max_shift", 0.10)    # [m]
+        p("lane_half", 0.19)         # 차선 가운데 ~ 선 안쪽 가장자리 [m] (차로 400 mm, 선 20 mm)
+        p("lane_width", [0.30, 0.48])  # 양쪽 선 안쪽 간격이 이 범위일 때만 차선으로 믿음 [m]
+        p("lane_min_points", 8)      # 한쪽 선에 이만큼 점이 있어야 [개]
+        p("lane_alpha", 0.3)         # 영상 한 장마다 반영 비율
+        p("maneuver_freeze_len", 1.5)  # 후진 또는 이보다 짧은 구간(칸 안에서 짧게 오가는 기동)만 움직이는 동안 카메라
+                                       #  보정을 쉼. T 줄기 오르내리기처럼 긴 직진은 양옆 선이 보여 보정해야 오차가 안 쌓임
+        p("overrun_ratio", 1.3)      # 주행 거리 감시: 구간 길이의 이 배 + overrun_margin 넘게 가면 구간 끝냄
+        p("overrun_margin", 0.3)     # [m]
         p("wait_localizer", False)   # true: /localizer/ready (출발 전 자리 맞추기 완료) 까지 출발 안 함
         p("stopline_camera", True)   # 카메라로 찾은 실제 정지선 앞에 서기
-        p("stopline_offset", 0.211)  # 차 중심 ~ 선 중심 [m] = 차 반 길이 0.161 + stop_gap 0.05 (build_courses 와 같게)
+        p("stopline_offset", 0.241)  # 차 중심 ~ 선 중심 [m] = 차 반 길이 0.161 + stop_gap 0.08 (missions.yaml 과 같게)
         p("stopline_tol", 0.5)       # 맵 기준 정차 위치와 이만큼 [m] 안의 선만 믿음 (넉넉하게)
-        p("stopline_max_age", 6.0)   # 이보다 오래된 검출은 버림 [s]
+        p("stopline_max_age", 15.0)  # 이보다 오래된 검출은 버림 [s] (주정차 칸 안에서 앞뒤로 오가는 동안 기억)
+        p("stopline_fix_max", 0.30)
+        p("end_line_camera", False)  # 칸 끝 노란 가로선 보고 서기: 칸 안은 비슷한 선이 가까이 많아 잘못 잡을 수 있음 →
+                                     #  기본 끔 (기동 중 위치 보정 멈춤 + 직전 정지선 보정으로 충분). 실차 칸 보고 다시 판단
+        p("end_line_gap", 0.04)      # 경로 마지막(마지막 주정차 칸) 끝: 카메라로 본 노란 가로선 앞 범퍼 여유 [m]
+        p("end_line_tol", 0.15)      # 맵 끝 위치와 이만큼 안의 노란 가로선만 믿음 [m]  # 정지선으로 앞뒤 위치 보정할 최대 [m] (더 크면 뭔가 잘못 → 안 고침)   # 이보다 오래된 검출은 버림 [s]
         p("safety_confirm", 0.2)     # 이만큼 [s] 계속 보여야 정지 (순간 잡음으로 섰다 갔다 방지. 0.3 m/s 에서 6 cm)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.g = g
@@ -105,9 +130,18 @@ class PurePursuit(Node):
         self.cone_off, self.in_cone, self.cone_stamp = 0.0, False, None
         self.line_dt, self.line_res = self.load_line_dt()
         self.sl_obs, self.sl_lock, self.sl_diff, self.stop_count = None, False, None, 0
+        self.end_obs_list, self.end_lock, self.end_cr_obs = [], False, None
         self.create_subscription(PointStamped, "/stopline", self.on_stopline, 10)
         self.pub_stop = self.create_publisher(String, "/pp/stop_event", 10)
+        # 기동 중(후진, 칸 안 짧은 구간): 카메라 위치 보정을 쉬게 함 (칸 안은 선이 적고 가까이 붙어
+        #  엉뚱한 선에 맞추기 쉬움 → 짧은 기동은 오도메트리가 더 믿을 만함)
+        self.pub_man = self.create_publisher(Bool, "/pp/maneuver", 10)
+        self.pub_shift = self.create_publisher(Vector3, "/localizer/shift", 10)
         self.loc_ready = False
+        self.wd_last, self.wd_dist = None, 0.0           # 주행 거리 감시: 이 구간에서 오도메트리로 간 거리
+        self.lane_pc, self.lane_stamp, self.lane_off = None, None, 0.0
+        self.create_subscription(PointCloud, "/lane/points", lambda m: setattr(self, "lane_pc", m), 5)
+        self.pub_lane = self.create_publisher(Float32, "/lane/offset", 10)
         self.create_subscription(Bool, "/localizer/ready", lambda m: setattr(self, "loc_ready", m.data),
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_timer(1.0 / g("rate"), self.tick)
@@ -127,7 +161,8 @@ class PurePursuit(Node):
         # 첫 점이 정지 표시(±2/±3)면 그만큼 서서 조향을 첫 구간에 맞춘 뒤 출발 (처음 출발, 정지선에서 경로 전환).
         # 달리는 중에 바뀐 경로(추월 재계획)는 첫 점이 ±1 → 멈추지 않고 이어서 추종
         self.seg, self.idx, self.done = 0, 0, False
-        self.sl_lock, self.sl_diff = False, None
+        self.wd_last, self.wd_dist = None, 0.0
+        self.sl_lock, self.sl_diff, self.end_lock, self.end_cr_obs = False, None, False, None
         z0 = abs(msg.poses[0].pose.position.z) if msg.poses else 1.0
         now = self.get_clock().now()
         waiting = getattr(self, "pause_until", None) is not None and now < self.pause_until
@@ -141,19 +176,25 @@ class PurePursuit(Node):
                                f"({' '.join('F' if s[0] > 0 else 'R' for s in self.segs)})")
 
     def on_stopline(self, m):
-        self.sl_obs = (m.point.x, m.point.y, self.get_clock().now().nanoseconds * 1e-9)
+        obs = (m.point.x, m.point.y, self.get_clock().now().nanoseconds * 1e-9)
+        if m.point.z > 0.5:
+            self.end_obs_list = (self.end_obs_list + [obs])[-40:]   # 노란 가로선 (칸 끝 선 후보) 최근 40개
+        else:
+            self.sl_obs = obs                   # 흰 가로선 (정지선)
 
-    def camera_remain(self):
-        """기억한 정지선(odom)까지 차 진행 방향 거리 - stopline_offset. 없으면 None."""
-        if self.sl_obs is None or self.get_clock().now().nanoseconds * 1e-9 - self.sl_obs[2] > self.g("stopline_max_age"):
+    def camera_remain(self, obs=None, offset=None):
+        """기억한 가로선(odom)까지 차 진행 방향 거리 - offset (기본: 정지선, stopline_offset). 없으면 None."""
+        obs = self.sl_obs if obs is None else obs
+        offset = self.g("stopline_offset") if offset is None else offset
+        if obs is None or self.get_clock().now().nanoseconds * 1e-9 - obs[2] > self.g("stopline_max_age"):
             return None
         try:
             t = self.tfb.lookup_transform("odom", "base_link", Time())
         except Exception:  # noqa: BLE001
             return None
         yaw = yaw_of(t.transform.rotation)
-        dx, dy = self.sl_obs[0] - t.transform.translation.x, self.sl_obs[1] - t.transform.translation.y
-        return dx * math.cos(yaw) + dy * math.sin(yaw) - self.g("stopline_offset")
+        dx, dy = obs[0] - t.transform.translation.x, obs[1] - t.transform.translation.y
+        return dx * math.cos(yaw) + dy * math.sin(yaw) - offset
 
     def stop(self):
         self.pub_cmd.publish(Twist())
@@ -206,6 +247,21 @@ class PurePursuit(Node):
         remain += math.hypot(pts[bi][0] - rx, pts[bi][1] - ry) if bi == len(pts) - 1 else 0.0
         hx, hy = math.cos(yaw) * d, math.sin(yaw) * d          # 진행 방향 단위벡터
         passed = bi >= len(pts) - 2 and ((ex - rx) * hx + (ey - ry) * hy) < 0
+        seg_l = sum(math.dist(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
+        self.pub_man.publish(Bool(data=d < 0 or seg_l < self.g("maneuver_freeze_len")))
+        # 주행 거리 감시 (오도메트리, 위치 보정과 무관)
+        try:
+            to = self.tfb.lookup_transform("odom", "base_link", Time())
+            op = (to.transform.translation.x, to.transform.translation.y)
+            if self.wd_last is not None:
+                self.wd_dist += math.dist(op, self.wd_last)
+            self.wd_last = op
+        except Exception:  # noqa: BLE001
+            pass
+        if self.wd_dist > seg_l * self.g("overrun_ratio") + self.g("overrun_margin"):
+            self.get_logger().warn(f"구간 {self.seg}: 길이 {seg_l:.2f} m 인데 {self.wd_dist:.2f} m 감 "
+                                   f"→ 위치 추정 이상, 이 구간 끝냄")
+            passed = True
         # 정지선 정차 구간 끝: 카메라로 본 실제 선이 맵 정차 위치와 가까우면 그 선 앞에 섬
         is_stop = d > 0 and self.seg + 1 < len(self.segs) and self.segs[self.seg + 1][3] > self.g("pause")
         if is_stop and self.g("stopline_camera") and remain < 1.3:
@@ -214,10 +270,30 @@ class PurePursuit(Node):
                 if not self.sl_lock:
                     self.sl_lock, self.sl_diff = True, cr - remain
                 remain, passed = max(cr, 0.0), cr < 0
+        # 경로 마지막 전진 구간(마지막 주정차 칸): 카메라로 본 칸 끝 노란 가로선 앞에 섬 (맵이 몇 cm 틀려도 칸 안에)
+        if self.g("end_line_camera") and d > 0 and self.seg == len(self.segs) - 1 and remain < 1.0:
+            # 최근 본 노란 가로선들 중 맵 끝 위치와 가장 가까운 것 (칸 옆 선을 비스듬히 본 가짜를 거름)
+            crs = [c for c in (self.camera_remain(o, 0.161 + self.g("end_line_gap")) for o in self.end_obs_list)
+                   if c is not None]
+            cr = min(crs, key=lambda c: abs(c - remain)) if crs else None
+            if self.end_lock and self.end_cr_obs is not None:
+                cr = self.camera_remain(self.end_cr_obs, 0.161 + self.g("end_line_gap"))
+            if cr is not None and (self.end_lock or abs(cr - remain) < self.g("end_line_tol")):
+                if not self.end_lock:
+                    self.end_lock = True
+                    self.end_cr_obs = min(self.end_obs_list, key=lambda o: abs(
+                        (self.camera_remain(o, 0.161 + self.g("end_line_gap")) or 9) - remain))
+                    self.get_logger().info(f"칸 끝 노란 선 봄 → 그 앞에 정차 (맵보다 {(cr - remain) * 100:+.0f} cm)")
+                remain, passed = max(cr, 0.0), cr < 0
         if remain < self.g("goal_tol") or passed:
             self.stop()
             if is_stop:
                 self.stop_count += 1
+                if self.sl_lock:                    # 실제 선 앞에 섰음 → 맵 정차 지점과 앞뒤 차이만큼 위치 추정 바로잡기
+                    e = (ex - rx) * math.cos(yaw) + (ey - ry) * math.sin(yaw)
+                    if 0.01 < abs(e) < self.g("stopline_fix_max"):
+                        self.pub_shift.publish(Vector3(x=e * math.cos(yaw), y=e * math.sin(yaw), z=0.0))
+                        self.get_logger().info(f"정지선으로 앞뒤 위치 보정 {e * 100:+.1f} cm")
                 src = "카메라" if self.sl_lock else "맵"
                 diff = f", 맵보다 {self.sl_diff * 100:+.0f} cm" if self.sl_lock else " (선 못 봄)"
                 self.get_logger().info(f"정지선 #{self.stop_count} 정차: {src}{diff}")
@@ -225,6 +301,7 @@ class PurePursuit(Node):
                     {"n": self.stop_count, "camera": self.sl_lock,
                      "diff": round(self.sl_diff, 3) if self.sl_lock else None}, ensure_ascii=False)))
             self.sl_obs, self.sl_lock, self.sl_diff = None, False, None
+            self.wd_last, self.wd_dist = None, 0.0
             if self.seg + 1 < len(self.segs):
                 self.seg, self.idx = self.seg + 1, 0
                 wait = self.segs[self.seg][3]
@@ -238,8 +315,13 @@ class PurePursuit(Node):
             return
 
         # 라바콘 구간: 라이다로 콘 사이 가운데로 경로를 옆으로 옮김 (아래 추종·안전 정지 모두 옮긴 경로 기준)
-        if d > 0 and self.g("cone_centering"):
-            pts = self.cone_shift(pts, bi, rx, ry)
+        if d > 0:
+            seg_len0 = sum(math.dist(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
+            if self.g("cone_centering"):
+                self.cone_update(pts, bi, rx, ry)
+            self.lane_update(pts, bi, self.g("lane_centering") and not self.in_cone
+                             and seg_len0 >= self.g("maneuver_length"))
+            pts = self.shift_path(pts, bi, self.cone_off if self.in_cone else self.lane_off)
 
         if d > 0 and self.g("safety") and self.path_blocked(pts, bi, rx, ry):
             self.stop()
@@ -299,21 +381,27 @@ class PurePursuit(Node):
         return (t.transform.translation.x + r[ok] * np.cos(a[ok] + lyaw),
                 t.transform.translation.y + r[ok] * np.sin(a[ok] + lyaw))
 
-    def cone_shift(self, pts, bi, rx, ry):
-        # 라바콘 구간: 차 위치 또는 앞 cone_pre 거리 안의 경로가 회색 선(맵) 근처면 → 들어가기 전부터 가운데 맞추기
+    def cone_update(self, pts, bi, rx, ry):
+        # 라이다 가운데 맞추기 구간 (차 위치 또는 앞 cone_pre 거리 안의 경로 기준 → 들어가기 전부터):
+        #   라바콘 구간 = 회색 선(맵) 근처, 미로 = lidar_zones 상자 (벽 위치는 모름 → 양쪽 벽 사이 가운데)
+        ahead, acc = [(rx, ry)], 0.0
+        for k in range(bi, len(pts) - 1):
+            acc += math.dist(pts[k], pts[k + 1])
+            if acc > self.g("cone_pre"):
+                break
+            ahead.append(pts[k + 1])
+        a = np.array(ahead[::2] + [ahead[-1]])
         in_zone = False
         if self.gray is not None:
-            ahead, acc = [(rx, ry)], 0.0
-            for k in range(bi, len(pts) - 1):
-                acc += math.dist(pts[k], pts[k + 1])
-                if acc > self.g("cone_pre"):
-                    break
-                ahead.append(pts[k + 1])
-            a = np.array(ahead[::2] + [ahead[-1]])
             dmin = np.min(np.hypot(a[:, 0, None] - self.gray[None, :, 0], a[:, 1, None] - self.gray[None, :, 1]))
             in_zone = float(dmin) < self.g("cone_zone_dist")
+        z = self.g("lidar_zones")
+        for q in range(0, len(z) - 3, 4):
+            x0, x1, y0, y1 = z[q:q + 4]
+            if np.any((a[:, 0] > x0) & (a[:, 0] < x1) & (a[:, 1] > y0) & (a[:, 1] < y1)):
+                in_zone = True
         if in_zone != self.in_cone:
-            self.get_logger().info("라바콘 구간 → 라이다 가운데 맞추기" if in_zone else "라바콘 구간 끝")
+            self.get_logger().info("라이다 가운데 맞추기 구간 시작 (라바콘·미로)" if in_zone else "라이다 가운데 맞추기 구간 끝")
             self.in_cone = in_zone
         if in_zone:
             stamp = (self.scan.header.stamp.sec, self.scan.header.stamp.nanosec) if self.scan else None
@@ -329,14 +417,92 @@ class PurePursuit(Node):
             lo, hi = self.line_room(pts, bi)
             self.cone_off = max(lo, min(hi, self.cone_off))
         self.pub_cone.publish(Float32(data=float(self.cone_off)))
-        if abs(self.cone_off) < 1e-3:
+
+    @staticmethod
+    def shift_path(pts, bi, off):
+        """앞쪽 경로를 진행 방향 왼쪽(+)으로 off 만큼 옮긴 사본."""
+        if abs(off) < 1e-3:
             return pts
         out = list(pts)
         for i in range(max(0, bi - 2), min(len(pts), bi + 80)):
             j0, j1 = max(0, i - 1), min(len(pts) - 1, i + 1)
             th = math.atan2(pts[j1][1] - pts[j0][1], pts[j1][0] - pts[j0][0])
-            out[i] = (pts[i][0] - math.sin(th) * self.cone_off, pts[i][1] + math.cos(th) * self.cone_off)
+            out[i] = (pts[i][0] - math.sin(th) * off, pts[i][1] + math.cos(th) * off)
         return out
+
+    def lane_update(self, pts, bi, active):
+        """실제 차선 가운데 - 원래 경로 (옆 거리) 를 영상마다 조금씩 반영. 안 쓸 때·못 볼 때는 천천히 0 으로."""
+        if not active:
+            self.lane_off *= 0.9
+        else:
+            m = self.lane_pc
+            stamp = (m.header.stamp.sec, m.header.stamp.nanosec) if m is not None else None
+            if stamp is not None and stamp != self.lane_stamp:
+                self.lane_stamp = stamp
+                tgt = self.lane_target(pts, bi, m)
+                if tgt is None:
+                    self.lane_off *= 0.95
+                else:
+                    lim = self.g("lane_max_shift")
+                    self.lane_off += self.g("lane_alpha") * (max(-lim, min(lim, tgt)) - self.lane_off)
+        self.pub_lane.publish(Float32(data=float(self.lane_off)))
+
+    def lane_target(self, pts, bi, m):
+        if not m.points:
+            return None
+        try:
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+        except Exception:  # noqa: BLE001
+            return None
+        yaw = yaw_of(t.transform.rotation)
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        ox = np.array([q.x for q in m.points])
+        oy = np.array([q.y for q in m.points])
+        px = t.transform.translation.x + c * ox - s_ * oy
+        py = t.transform.translation.y + s_ * ox + c * oy
+        lat = self.lateral(pts, bi, px, py, 1.4)
+        if lat is None:
+            return None
+        n_min = self.g("lane_min_points")
+        if np.sum(np.abs(lat) < 0.05) >= n_min:                 # 경로 가운데에 선 = 정지선·가로지르는 점선 → 안 씀
+            return None
+        left, right = lat[(lat > 0.05) & (lat < 0.40)], lat[(lat < -0.05) & (lat > -0.40)]
+        half = self.g("lane_half")
+        wmin, wmax = self.g("lane_width")
+        if len(left) >= n_min and len(right) >= n_min:
+            le, re = float(np.percentile(left, 10)), float(np.percentile(right, 90))   # 안쪽 가장자리
+            if wmin <= le - re <= wmax:
+                return (le + re) / 2
+            return None
+        if len(left) >= n_min:
+            le = float(np.percentile(left, 10))
+            return le - half if 0.08 < le < 0.32 else None
+        if len(right) >= n_min:
+            re = float(np.percentile(right, 90))
+            return re + half if -0.32 < re < -0.08 else None
+        return None
+
+    def lateral(self, pts, bi, px, py, look):
+        """점들(맵 좌표)의 경로 기준 옆 거리 (+ 왼쪽). 경로 앞 look [m] 조각 위로 수직 투영되고 0.4 m 안인 점만."""
+        win, acc = [bi], 0.0
+        for i in range(bi, len(pts) - 1):
+            acc += math.dist(pts[i], pts[i + 1])
+            if acc > look:
+                break
+            win.append(i + 1)
+        if len(win) < 2 or len(px) == 0:
+            return None
+        wx = np.array([pts[i][0] for i in win])
+        wy = np.array([pts[i][1] for i in win])
+        dd = np.hypot(px[:, None] - wx[None], py[:, None] - wy[None])
+        j = np.clip(np.argmin(dd, axis=1), 0, len(win) - 2)
+        tx, ty = wx[j + 1] - wx[j], wy[j + 1] - wy[j]
+        n = np.hypot(tx, ty) + 1e-9
+        lat = (tx * (py - wy[j]) - ty * (px - wx[j])) / n
+        along = (tx * (px - wx[j]) + ty * (py - wy[j])) / n
+        # 경로 조각 위로 수직 투영되고 실제 0.4 m 안 (확인 범위 끝 너머 다음 곡선의 점을 '바로 옆'으로 착각하지 않게)
+        ok = (dd.min(axis=1) < 0.40) & (along < n + 0.03) & ((along > -0.03) | ((j > 0) & (along > -0.08)))
+        return lat[ok]
 
     def line_room(self, pts, bi):
         """앞 cone_line_look 경로를 옆으로 o 만큼 옮겨도 차 중심이 노란 선에서 cone_line_clear 이상인 o 범위 (lo, hi)."""
@@ -377,29 +543,10 @@ class PurePursuit(Node):
         sp = self.scan_map(1.5)
         if sp is None:
             return None
-        px, py = sp
-        win, acc = [bi], 0.0
-        for i in range(bi, len(pts) - 1):
-            acc += math.dist(pts[i], pts[i + 1])
-            if acc > self.g("cone_look"):
-                break
-            win.append(i + 1)
-        if len(win) < 2:
+        lat = self.lateral(pts, bi, sp[0], sp[1], self.g("cone_look"))
+        if lat is None:
             return None
-        wx = np.array([pts[i][0] for i in win])
-        wy = np.array([pts[i][1] for i in win])
-        dd = np.hypot(px[:, None] - wx[None], py[:, None] - wy[None])
-        j = np.argmin(dd, axis=1)
-        j = np.clip(j, 0, len(win) - 2)
-        tx, ty = wx[j + 1] - wx[j], wy[j + 1] - wy[j]
-        n = np.hypot(tx, ty) + 1e-9
-        lat = (tx * (py - wy[j]) - ty * (px - wx[j])) / n          # + = 경로 왼쪽
-        along = (tx * (px - wx[j]) + ty * (py - wy[j])) / n
-        # 경로 조각 위로 수직 투영되고 경로에서 실제 0.4 m 안인 점만 (확인 범위 끝 너머 다음 곡선의 콘을
-        #  연장선 기준으로 '바로 옆'이라고 착각하지 않게)
-        seglen = n - 1e-9
-        ok = (dd.min(axis=1) < 0.40) & (along < seglen + 0.03) & ((along > -0.03) | ((j > 0) & (along > -0.08)))
-        left, right = lat[ok & (lat > 0)], lat[ok & (lat < 0)]
+        left, right = lat[lat > 0], lat[lat < 0]
         gap = self.g("cone_gap")
         if len(left) and len(right):
             return (left.min() + right.max()) / 2

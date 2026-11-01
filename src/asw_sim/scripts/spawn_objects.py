@@ -8,7 +8,7 @@
 import os
 
 import rclpy
-from asw_nav import objects_io
+from asw_nav import objects_io, world_warp
 from gazebo_msgs.srv import DeleteEntity, GetModelList, SpawnEntity
 from rclpy.node import Node
 
@@ -38,6 +38,8 @@ class Spawner(Node):
         super().__init__("spawn_objects")
         self.declare_parameter("file", "")
         self.declare_parameter("scenario", "")     # 맵 1~4 (비우면 objects.yaml 의 scenario)
+        self.declare_parameter("randomize", 0)     # 시험용: 소품 크기·위치 무작위 (시드, 0 = 끔)
+        self.declare_parameter("warp", "")         # 틀린 맵 시험: 소품도 세계(변형된 트랙) 기준 자리로
         self.cli_spawn = self.create_client(SpawnEntity, "/spawn_entity")
         self.cli_del = self.create_client(DeleteEntity, "/delete_entity")
         self.cli_list = self.create_client(GetModelList, "/get_model_list")
@@ -63,7 +65,12 @@ class Spawner(Node):
             self.call(self.cli_del, DeleteEntity.Request(name=n), 5.0)
         # 2) 새로 배치
         objs = objects_io.load(self.get_parameter("file").value or None,
-                               scenario=self.get_parameter("scenario").value or None)
+                               scenario=self.get_parameter("scenario").value or None,
+                               randomize=self.get_parameter("randomize").value)
+        w = world_warp.load(self.get_parameter("warp").value)
+        if w is not None:
+            for o in objs:
+                o["x"], o["y"], o["yaw"] = w.pose_fwd(o["x"], o["y"], o["yaw"])
         ok = 0
         for o in objs:
             req = SpawnEntity.Request(name=PREFIX + o["name"], xml=sdf(o))

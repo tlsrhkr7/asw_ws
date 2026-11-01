@@ -39,6 +39,10 @@ class TrailRecorder(Node):
         # 카메라-맵 매칭 정보 (lane_localizer): [점수 전, 점수 후, 점 개수, dx, dy, dyaw, 반영]
         self.loc, self.loc_t = None, 0.0
         self.create_subscription(Float32MultiArray, "/localizer/info", self.on_loc, 20)
+        # 경로 옆으로 옮긴 양: 차선 가운데 맞추기(카메라), 라바콘·미로 가운데 맞추기(라이다)
+        self.lane_off = self.cone_off = 0.0
+        self.create_subscription(Float32, "/lane/offset", lambda m: setattr(self, "lane_off", m.data), 20)
+        self.create_subscription(Float32, "/cone/offset", lambda m: setattr(self, "cone_off", m.data), 20)
         self.pub_o = self.create_publisher(Path, "/trail/odom", 5)
         self.pub_g = self.create_publisher(Path, "/trail/gt", 5)
         self.path_o, self.path_g = Path(), Path()
@@ -49,7 +53,7 @@ class TrailRecorder(Node):
         self.fname = os.path.join(d, time.strftime("run_%Y%m%d_%H%M%S") + (f"_{tag}" if tag else "") + ".csv")
         self.f = open(self.fname, "w", encoding="utf-8")
         self.f.write("t,odom_x,odom_y,odom_yaw,gt_x,gt_y,gt_yaw,cte,"
-                     "loc_score,loc_score_after,loc_points,loc_dx,loc_dy,loc_dyaw,loc_applied\n")
+                     "loc_score,loc_score_after,loc_points,loc_dx,loc_dy,loc_dyaw,loc_applied,lane_off,cone_off\n")
         self.t0 = None
         self.last_o = None
         self.dist = 0.0
@@ -84,7 +88,7 @@ class TrailRecorder(Node):
         # 매칭 정보는 0.3초 안에 새로 온 것만 (안 오면 nan = 카메라 보정 꺼짐/데이터 없음)
         loc = self.loc if self.loc and time.time() - self.loc_t < 0.3 else [float("nan")] * 7
         self.f.write(f"{ts - self.t0:.3f},{ox:.4f},{oy:.4f},{oyaw:.4f},{gx:.4f},{gy:.4f},{gyaw:.4f},{self.cte:.4f},"
-                     + ",".join(f"{v:.4f}" for v in loc) + "\n")
+                     + ",".join(f"{v:.4f}" for v in loc) + f",{self.lane_off:.4f},{self.cone_off:.4f}\n")
         if moved:
             for path, x, y in ((self.path_o, ox, oy), (self.path_g, gx, gy)):
                 if math.isnan(x):
