@@ -1,0 +1,8 @@
+# 실차 LIMO 오도메트리 보정 (limo_driver). 녹화 후 노트북에서 asw_review <bag> --odom 으로 구함.
+#   wheel_speed_scale: 줄자로 잰 실제 거리 / odom 거리 (곧게 2~3 m 가 보고). 지금 값에 곱해서 갱신
+#   steer_bias: 조향 0 명령인데 실제 차가 휘면 그 중앙 조향각 [rad] (직진 시 odom 요레이트가 0 되도록)
+# 섀시가 바퀴 엔코더로 속도를 직접 내므로 바퀴 지름은 필요 없음 (펌웨어가 환산)
+/**:
+  ros__parameters:
+    wheel_speed_scale: 1.0
+    steer_bias: 0.0

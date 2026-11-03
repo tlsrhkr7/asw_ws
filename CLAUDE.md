@@ -46,7 +46,14 @@
 - wego `limo_base`는 Ackermann 모드에서 `/odom`을 안 낸다 (publishOdometry에 Ackermann 분기 없음).
   `limo_ackerman_base`는 AckermannDrive(`/limo/ack_cmd`) 입력 + odom 식 오류. → 그래서 `asw_limo_base` 사용
 - 드라이버 상수(신뢰): wheelbase 0.200, track 0.172, 최대 내측 조향 28°, 조향 스케일 2.47
-- **실측 필요**: 카메라 위치·높이·기울기·화각, 라이다 위치, 바퀴 지름 (URDF 맨 위 property만 수정)
+- 카메라·라이다 위치: AgileX 공식 URDF(LIMO `~/limo_ros2_ws/.../limo_ackerman.xacro`, base_link 지면+0.15) 값 =
+  카메라 x 0.084 z 0.180 기울기 0, 라이다 x 0.103 z 0.116. 사용자가 줄자로 비슷함 확인 (2026-11-04)
+- 카메라 camera_info (실차): fx=fy 488.33, cx 320.8, cy 213.8, 왜곡 작음(k1 0.062) → hfov 66.5°. 실차 코드는 camera_info 그대로 씀
+- orbbec TF: camera_link(깊이 카메라) → camera_color_frame **y −0.0298** (컬러 렌즈가 3 cm 오른쪽). 카메라 기본 자동 노출·자동 WB
+  → limo.launch `cam_auto_exposure/cam_exposure/cam_gain/cam_auto_wb/cam_wb` 로 고정 가능
+- 오도메트리: 섀시가 엔코더로 속도를 직접 냄 → 바퀴 지름 불필요. 보정은 `config/limo_calib.yaml`
+  (wheel_speed_scale, steer_bias, 녹화 후 `asw_review <bag> --odom`)
+- **실측 필요**: camera_link 좌우 위치 `cam_y` (차로 가운데에 놓고 녹화 → asw_review '가운데' 0), 오도메트리 보정
 - `limo_driver`의 원본과 다른 점(의도): /cmd_vel 0.5초 끊기면 정지, 50Hz 명령 송신, max_speed 1.0, Ackermann 모드 아니면 구동 안 함
 
 ## 대회 규정 핵심 (2025 규정집 PDF 확인)

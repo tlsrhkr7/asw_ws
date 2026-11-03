@@ -5,7 +5,9 @@
 #   asw_build            빌드 (코드 바꾼 뒤. 파이썬만 바꿨으면 보통 불필요)
 #   asw_sim [인자]       [터미널 1] Gazebo + 트랙 + 로버(출발 구역) + RViz
 #   asw_drive [인자]     [터미널 2] 경로 + Pure Pursuit + 기록  (끝나면 Ctrl-C → 요약 출력)
-#   asw_teleop           [터미널 2 대신] 키보드로 직접 운전
+#   asw_teleop           [터미널 2 대신] 키보드로 직접 운전 (자이카식 창: W/S/A/D, S 계속 = 후진)
+#   asw_review <bag> [--stats]  녹화(record.launch) 분석 창: 차선·정지선·반사 덩어리 확인, 색 기준 맞추기(p 저장)
+#   asw_bag_get [이름]   LIMO 의 최근(또는 이름) 녹화를 노트북 ~/asw_bags 로 가져오기
 #   asw_plot [로그]      최근(또는 지정) 주행 로그 요약 + 그래프 png
 #   asw_test [경로]      헤드리스 자동 시험 (창 없이 sim+drive 실행 → 완료 → 요약)
 #   asw_paths            사용 가능한 경로 목록
@@ -25,7 +27,7 @@ source /opt/ros/humble/setup.bash
 [ -f "$ASW_WS/install/setup.bash" ] && source "$ASW_WS/install/setup.bash"
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}   # 시뮬은 0. 실차 LIMO 토픽을 노트북에서 볼 때만 asw_limo_domain
 
-asw_help() { sed -n '2,21p' "$ASW_REPO/scripts/asw_env.sh"; }
+asw_help() { sed -n '2,23p' "$ASW_REPO/scripts/asw_env.sh"; }
 asw_watch() { bash "$ASW_REPO/scripts/watch_run.sh" "$@"; }
 asw_map()   { bash "$ASW_REPO/scripts/watch_scenario.sh" "$@"; }
 asw_objects() { ros2 run asw_sim spawn_objects.py --ros-args -p use_sim_time:=true "$@"; }
@@ -38,7 +40,13 @@ asw_build() {
 
 asw_sim()    { ros2 launch asw_sim sim.launch.py "$@"; }
 asw_drive()  { ros2 launch asw_bringup drive.launch.py "$@"; }
-asw_teleop() { ros2 run teleop_twist_keyboard teleop_twist_keyboard; }
+asw_teleop() { ros2 run asw_nav teleop_key "$@"; }
+asw_review() { ASW_REPO="$ASW_REPO" ros2 run asw_nav perception_review "$@"; }
+asw_bag_get() {   # Windows ssh 설정의 별칭으로 가져옴 (핫스팟 limo-hs 기본, LIMO 와이파이면 ASW_LIMO=limo)
+  local H="${ASW_LIMO:-limo-hs}" D="/mnt/c/Users/신동준/asw_bags"
+  local N="${1:-$(ssh.exe "$H" 'ls -t ~/asw_bags | head -1' | sed 's/\r$//')}"
+  mkdir -p "$D" && (cd "$D" && scp.exe -r "$H:asw_bags/$N" .) && echo "$D/$N  →  asw_review $D/$N"
+}
 asw_plot()   { python3 "$ASW_REPO/scripts/plot_run.py" "$@"; }
 asw_paths()  { ls "$ASW_REPO/src/asw_nav/paths" | grep csv; }
 asw_path()   { python3 "$ASW_REPO/src/asw_nav/scripts/path_from_image.py" "$@" && asw_build --packages-select asw_nav >/dev/null; }

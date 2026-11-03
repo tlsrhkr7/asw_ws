@@ -33,7 +33,14 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory("orbbec_camera"), "launch", "astra_stereo_u3.launch.py")),
         launch_arguments={"camera_name": "camera", "color_width": "640", "color_height": "480",
-                          "color_fps": "30", "enable_point_cloud": "false"}.items(),
+                          "color_fps": "30", "enable_point_cloud": "false",
+                          # 노출·화이트밸런스: 기본 자동 (orbbec 기본값). 반사·조명 때문에 색이 흔들리면 고정값으로
+                          #  예) cam_auto_exposure:=false cam_exposure:=150 cam_gain:=16 cam_auto_wb:=false cam_wb:=4600
+                          "enable_color_auto_exposure": LaunchConfiguration("cam_auto_exposure"),
+                          "color_exposure": LaunchConfiguration("cam_exposure"),
+                          "color_gain": LaunchConfiguration("cam_gain"),
+                          "enable_color_auto_white_balance": LaunchConfiguration("cam_auto_wb"),
+                          "color_white_balance": LaunchConfiguration("cam_wb")}.items(),
         condition=IfCondition(LaunchConfiguration("camera")))
 
     return LaunchDescription([
@@ -42,9 +49,15 @@ def generate_launch_description():
         DeclareLaunchArgument("cam_pitch", default_value="0.0"),
         DeclareLaunchArgument("camera", default_value="true"),
         DeclareLaunchArgument("lidar", default_value="true"),
+        DeclareLaunchArgument("cam_auto_exposure", default_value="true"),
+        DeclareLaunchArgument("cam_exposure", default_value="-1"),   # -1 = 카메라 기본
+        DeclareLaunchArgument("cam_gain", default_value="-1"),
+        DeclareLaunchArgument("cam_auto_wb", default_value="true"),
+        DeclareLaunchArgument("cam_wb", default_value="-1"),
 
         Node(package="asw_limo_base", executable="limo_driver", output="screen",
-             parameters=[{"port": LaunchConfiguration("port"),
+             parameters=[os.path.join(share, "config", "limo_calib.yaml"),     # 오도메트리 보정 (asw_review --odom)
+                         {"port": LaunchConfiguration("port"),
                           "yaw_source": LaunchConfiguration("yaw_source")}]),
         Node(package="robot_state_publisher", executable="robot_state_publisher", output="screen",
              parameters=[{"robot_description": robot_description}]),

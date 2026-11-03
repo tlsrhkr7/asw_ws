@@ -3,6 +3,20 @@
 전제: 미리 아는 것은 **평면 트랙 맵뿐**. 칸막이·장애물·라바콘·사람 위치는 모름 → 전부 라이다/카메라로 판단.
 아래 항목이 틀리면 시뮬에서 되던 것이 실차에서 안 된다. 월요일 첫 주행 전에 위에서부터 확인.
 
+## 0. 녹화 → 노트북 분석 (자율주행 전에, 반사광·테이프·조명 확인)
+1. 노트북 `.\scripts\deploy.ps1` (핫스팟이면 `-HostName limo-hs`)
+2. LIMO 화면(NoMachine)의 터미널, **차 주변 확인 후**: `source ~/asw_ws/install/setup.bash && ros2 launch asw_bringup record.launch.py name:=조명1`
+   → 조종 창(클릭해서 포커스): W 가속, S 감속→계속 누르면 후진, A/D 조향(누르는 동안), 1/2/3 = 0.1/0.2/0.3 m/s, R 후진, SPACE 정지.
+   창 밖을 클릭하면 바로 정지. 끝낼 때 터미널 Ctrl-C (정지 명령 보내고 녹화 닫힘). 저장: `~/asw_bags/<날짜>_조명1`
+3. 트랙 한 바퀴 + 정지선 5곳 앞 잠깐 정지 + 주차 칸 넣었다 빼기. 조명 바꿔 2~3번 (10분 ≈ 0.4 GB)
+   - 노출 고정 비교: `cam_auto_exposure:=false cam_exposure:=150` 처럼 한 번 더 (반사에 덜 흔들리는지)
+   - **보정용 녹화 (따로 하나, name:=calib)**: ① 차로 가운데에 똑바로 놓고 5초 정지 → asw_review 첫 장의 '가운데'가
+     0 이 아니면 그만큼 URDF `cam_y` 수정 (카메라 좌우 위치). ② 바닥에 줄자 깔고 A/D 안 누르고 곧게 2~3 m →
+     `asw_review <bag> --odom` → 실제 거리/간 거리 = `config/limo_calib.yaml` wheel_speed_scale, 휘었으면 steer_bias
+4. WSL: `asw_bag_get` (최근 녹화 가져오기) → `asw_review /mnt/c/Users/신동준/asw_bags/<이름>`
+   → `t` 통계: 차선 인식률·못 본 가장 긴 시간·정지선 후보 위치 묶음(진짜 5곳 말고 생긴 곳 = 가짜)·밝은 덩어리
+   → 막대로 색 기준 조절 → `p` 저장(config/perception.yaml, 실차 주행에만 적용) → deploy
+
 ## 1. 라이다가 물체를 실제로 보는가 (가장 중요)
 - [ ] **라이다 높이 vs 물체 높이.** URDF `lidar_z` 0.116 m 는 미확인 값. 종이컵(보통 9~10 cm)이 스캔 평면보다
       낮으면 **라이다가 컵을 전혀 못 봄** → 추월 장애물·라바콘·안전 정지 모두 실패.

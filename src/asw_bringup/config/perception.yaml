@@ -1,0 +1,11 @@
+# 카메라 선 검출 색 기준 (HSV, OpenCV: H 0~179, S·V 0~255). lane_localizer·stopline_detector 공용.
+# 현장에서: 녹화(record.launch) → 노트북 분석 창(perception_review)에서 맞추고 s 키 → 이 파일 저장 → asw_build
+/**:
+  ros__parameters:
+    white_s_max: 50        # 흰 선: 채도 이하
+    white_v_min: 170       #        밝기 이상
+    yellow_h: [15, 40]     # 노란 선: 색상 범위
+    yellow_s_min: 80
+    yellow_v_min: 100
+    gray_s_max: 40         # 회색 선(라바콘 구간): 채도 이하 + 밝기 범위
+    gray_v: [60, 140]

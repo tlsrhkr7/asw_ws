@@ -27,6 +27,10 @@
   선을 못 보면 맵 기준. 카메라로 섰으면 '맵의 정차 지점 - 지금 추정 위치' 의 앞뒤 차이를 /localizer/shift 로 보내
   위치 추정을 바로잡는다 (곧은 차로에서는 선으로 앞뒤를 못 맞춰 쌓이던 오차를 정지선마다 초기화).
   정차할 때마다 /pp/stop_event (JSON: 몇 번째, 카메라/맵, 맵과 차이) → mission_manager 구간 판단.
+막혔을 때 비켜 가기 (영구 정지 방지): 안전 정지가 avoid_after 초 넘게 이어지고 막은 물체가 avoid_still 초 동안
+  안 움직였으면(사람은 비킬 시간을 줌), 경로를 옆으로 ±avoid_max 안에서 옮겨 볼 때 앞 avoid_look 띠가 비고
+  맵 노란 선에서 차 중심이 avoid_line_clear 이상인 가장 작은 옮김을 골라 avoid_speed 로 천천히 비켜 감.
+  물체가 차 뒤로 avoid_pass 만큼 지나가면 간 거리에 따라 원래 경로로 돌아옴. 비켜 갈 곳이 없으면 계속 기다림.
 """
 import json
 import math
@@ -110,6 +114,17 @@ class PurePursuit(Node):
         p("end_line_gap", 0.04)      # 경로 마지막(마지막 주정차 칸) 끝: 카메라로 본 노란 가로선 앞 범퍼 여유 [m]
         p("end_line_tol", 0.15)      # 맵 끝 위치와 이만큼 안의 노란 가로선만 믿음 [m]  # 정지선으로 앞뒤 위치 보정할 최대 [m] (더 크면 뭔가 잘못 → 안 고침)   # 이보다 오래된 검출은 버림 [s]
         p("safety_confirm", 0.2)     # 이만큼 [s] 계속 보여야 정지 (순간 잡음으로 섰다 갔다 방지. 0.3 m/s 에서 6 cm)
+        p("avoid", True)             # 막혔을 때 비켜 가기
+        p("avoid_after", 8.0)        # 안전 정지가 이만큼 [s] 이어지면 (지나가는 사람은 기다림)
+        p("avoid_still", 2.0)        # 막은 점들 가운데가 이만큼 [s] 동안 avoid_still_tol 안에 있어야 (움직이는 사람 X)
+        p("avoid_still_tol", 0.05)   # [m]
+        p("avoid_max", 0.45)         # 경로를 옆으로 옮길 최대 [m] (차로 하나 0.4 + 여유. 노란 선 여유가 먼저 막음)
+        p("avoid_look", 0.9)         # 옮긴 경로 앞 이만큼 [m] (차 앞 범퍼 기준) 띠가 비어야
+        p("avoid_half_width", 0.14)  # 그 띠 반폭 [m] (차 반폭 0.11 + 3 cm)
+        p("avoid_line_clear", 0.12)  # 차 중심 ~ 맵 노란 선 최소 [m] (차 반폭 + 1 cm: 선은 안 밟음)
+        p("avoid_speed", 0.10)       # 비켜 가는 동안 속도 [m/s]
+        p("avoid_pass", 0.30)        # 막았던 물체가 차 중심 뒤로 이만큼 [m] 가면 돌아오기 시작
+        p("avoid_return", 0.30)      # 돌아올 때 1 m 갈 때마다 옮김을 이만큼 [m] 줄임
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.g = g
         self.tfb = Buffer()
@@ -121,7 +136,7 @@ class PurePursuit(Node):
         self.create_subscription(Path, "/plan", self.on_plan,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.segs = []
-        self.scan, self.blocked_since, self.clear_since, self.hit_since = None, None, None, None
+        self.scan, self.blocked_since, self.clear_since, self.hit_since, self.hit_c = None, None, None, None, None
         self.create_subscription(LaserScan, "/scan", lambda m: setattr(self, "scan", m), qos_profile_sensor_data)
         self.pub_safety = self.create_publisher(Bool, "/safety/stop", 10)
         self.pub_cone = self.create_publisher(Float32, "/cone/offset", 10)
@@ -138,6 +153,8 @@ class PurePursuit(Node):
         self.pub_man = self.create_publisher(Bool, "/pp/maneuver", 10)
         self.pub_shift = self.create_publisher(Vector3, "/localizer/shift", 10)
         self.loc_ready = False
+        self.avoid_off, self.avoid_obj, self.avoid_last = 0.0, None, None   # 비켜 가기: 옮김, 막았던 물체(맵), 지난 위치
+        self.block_hist = []                                             # 막는 동안 (시각, 막은 점 가운데)
         self.wd_last, self.wd_dist = None, 0.0           # 주행 거리 감시: 이 구간에서 오도메트리로 간 거리
         self.lane_pc, self.lane_stamp, self.lane_off = None, None, 0.0
         self.create_subscription(PointCloud, "/lane/points", lambda m: setattr(self, "lane_pc", m), 5)
@@ -321,13 +338,19 @@ class PurePursuit(Node):
                 self.cone_update(pts, bi, rx, ry)
             self.lane_update(pts, bi, self.g("lane_centering") and not self.in_cone
                              and seg_len0 >= self.g("maneuver_length"))
-            pts = self.shift_path(pts, bi, self.cone_off if self.in_cone else self.lane_off)
+            base_off = self.cone_off if self.in_cone else self.lane_off
+            self.avoid_progress(rx, ry, yaw)
+            pts0, pts = pts, self.shift_path(pts, bi, base_off + self.avoid_off)
 
         if d > 0 and self.g("safety") and self.path_blocked(pts, bi, rx, ry):
-            self.stop()
-            return
+            if not (self.g("avoid") and self.try_avoid(pts0, bi, rx, ry, base_off)):
+                self.stop()
+                return
+            pts = self.shift_path(pts0, bi, base_off + self.avoid_off)
 
         v_ref = self.g("speed") if d > 0 else self.g("reverse_speed")
+        if d > 0 and abs(self.avoid_off) > 0.02:
+            v_ref = min(v_ref, self.g("avoid_speed"))
         v = min(v_ref, max(0.05, math.sqrt(2 * self.g("decel") * remain)))
         cmd = Twist()
         cmd.linear.x = v * d
@@ -504,17 +527,19 @@ class PurePursuit(Node):
         ok = (dd.min(axis=1) < 0.40) & (along < n + 0.03) & ((along > -0.03) | ((j > 0) & (along > -0.08)))
         return lat[ok]
 
-    def line_room(self, pts, bi):
-        """앞 cone_line_look 경로를 옆으로 o 만큼 옮겨도 차 중심이 노란 선에서 cone_line_clear 이상인 o 범위 (lo, hi)."""
+    def line_room(self, pts, bi, lim=None, clear=None):
+        """앞 cone_line_look 경로를 옆으로 o 만큼 옮겨도 차 중심이 노란 선에서 clear(기본 cone_line_clear) 이상인
+        o 범위 (lo, hi). o 는 ±lim (기본 cone_max_shift) 안."""
+        lim = self.g("cone_max_shift") if lim is None else lim
+        clear = self.g("cone_line_clear") if clear is None else clear
         if self.line_dt is None:
-            return -self.g("cone_max_shift"), self.g("cone_max_shift")
+            return -lim, lim
         idx, acc = [bi], 0.0
         for i in range(bi, len(pts) - 1):
             acc += math.dist(pts[i], pts[i + 1])
             if acc > self.g("cone_line_look"):
                 break
             idx.append(i + 1)
-        lim = self.g("cone_max_shift")
         offs = np.arange(-lim, lim + 1e-9, 0.01)
         px = np.array([pts[i][0] for i in idx])
         py = np.array([pts[i][1] for i in idx])
@@ -526,7 +551,7 @@ class PurePursuit(Node):
         n = self.line_dt.shape[0]
         u = np.clip((X / self.line_res).astype(int), 0, n - 1)
         v = np.clip(((n * self.line_res - Y) / self.line_res).astype(int), 0, n - 1)
-        okk = self.line_dt[v, u].min(axis=1) >= self.g("cone_line_clear")
+        okk = self.line_dt[v, u].min(axis=1) >= clear
         k0 = int(np.argmin(np.abs(offs)))
         if not okk[k0]:
             return 0.0, 0.0
@@ -556,10 +581,51 @@ class PurePursuit(Node):
             return max(0.0, right.max() + gap)
         return None
 
+    def avoid_progress(self, rx, ry, yaw):
+        """비켜 가는 중: 막았던 물체가 차 뒤로 avoid_pass 넘게 가면, 간 거리만큼 옮김을 줄여 원래 경로로."""
+        if self.avoid_obj is None:
+            return
+        last, self.avoid_last = self.avoid_last, (rx, ry)
+        behind = (rx - self.avoid_obj[0]) * math.cos(yaw) + (ry - self.avoid_obj[1]) * math.sin(yaw)
+        if last is None or behind < self.g("avoid_pass"):
+            return
+        step = self.g("avoid_return") * math.dist(last, (rx, ry))
+        self.avoid_off = math.copysign(max(0.0, abs(self.avoid_off) - step), self.avoid_off)
+        if self.avoid_off == 0.0:
+            self.get_logger().info("비켜 가기 끝 → 원래 경로")
+            self.avoid_obj, self.avoid_last = None, None
+
+    def try_avoid(self, pts0, bi, rx, ry, base_off):
+        """오래 막혀 있고 막은 물체가 안 움직이면, 비어 있는 옆으로 경로를 옮김. 옮겼으면 True."""
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.blocked_since is None or now - self.blocked_since < self.g("avoid_after") or not self.block_hist:
+            return False
+        recent = [c for t, c in self.block_hist if now - t <= self.g("avoid_still")]
+        if now - self.block_hist[0][0] < self.g("avoid_still") or len(recent) < 3:
+            return False
+        cx, cy = float(np.mean([c[0] for c in recent])), float(np.mean([c[1] for c in recent]))
+        if max(math.hypot(c[0] - cx, c[1] - cy) for c in recent) > self.g("avoid_still_tol"):
+            return False                                       # 막은 것이 움직이는 중 (사람) → 더 기다림
+        lim = self.g("avoid_max")
+        lo, hi = self.line_room(pts0, bi, lim, self.g("avoid_line_clear"))
+        cands = sorted((o for o in np.arange(-lim, lim + 1e-9, 0.02) if lo <= o <= hi and abs(o - base_off) > 0.05),
+                       key=lambda o: abs(o - base_off - self.avoid_off))
+        reach = 0.161 + self.g("avoid_look")
+        for o in cands:
+            if not self.scan_on_path(self.shift_path(pts0, bi, o), bi, rx, ry, reach, self.g("avoid_half_width")):
+                self.avoid_off = float(o) - base_off
+                self.avoid_obj, self.avoid_last = (cx, cy), None
+                self.blocked_since, self.clear_since, self.hit_since, self.block_hist = None, None, None, []
+                self.get_logger().warn(f"{self.g('avoid_after'):.0f}초 넘게 막힘 (물체 안 움직임) → 경로를 "
+                                       f"{'왼' if o > 0 else '오른'}쪽으로 {abs(o) * 100:.0f} cm 옮겨 천천히 비켜 감")
+                return True
+        self.get_logger().warn("막힘: 비켜 갈 빈 곳 없음 → 계속 대기", throttle_duration_sec=5.0)
+        return False
+
     def path_blocked(self, pts, bi, rx, ry):
         """앞으로 갈 경로 띠 안에 라이다 점이 있으면 True (정지 유지 시간 포함)."""
         now = self.get_clock().now().nanoseconds * 1e-9
-        hit = self.scan_on_path(pts, bi, rx, ry)
+        hit = self.scan_on_path(pts, bi, rx, ry, track=True)
         self.hit_since = (self.hit_since or now) if hit else None
         if hit and self.blocked_since is None and now - self.hit_since < self.g("safety_confirm"):
             hit = 0                                         # 아직 확인 중
@@ -567,17 +633,21 @@ class PurePursuit(Node):
             if self.blocked_since is None:
                 self.get_logger().warn(f"앞 장애물 → 정지 ({hit} 점)")
             self.blocked_since, self.clear_since = self.blocked_since or now, None
+            if self.hit_c is not None:
+                self.block_hist = [h for h in self.block_hist if now - h[0] < 10.0] + [(now, self.hit_c)]
         elif self.blocked_since is not None:
             self.clear_since = self.clear_since or now
             if now - self.clear_since >= self.g("safety_clear"):
                 self.get_logger().info(f"앞이 비었음 → 출발 ({now - self.blocked_since:.1f}초 정지)")
-                self.blocked_since, self.clear_since = None, None
+                self.blocked_since, self.clear_since, self.block_hist = None, None, []
         self.pub_safety.publish(Bool(data=self.blocked_since is not None))
         return self.blocked_since is not None
 
-    def scan_on_path(self, pts, bi, rx, ry):
-        # 확인할 경로 점: 차 중심에서 앞 BODY_L/2 + safety_dist 까지
-        reach = 0.161 + self.g("safety_dist")
+    def scan_on_path(self, pts, bi, rx, ry, reach=None, hw=None, track=False):
+        # 확인할 경로 점: 차 중심에서 앞 BODY_L/2 + safety_dist 까지. track: 걸린 점들 가운데를 self.hit_c 에
+        reach = 0.161 + self.g("safety_dist") if reach is None else reach
+        if track:
+            self.hit_c = None
         cx, cy, acc = [rx], [ry], 0.0
         for i in range(bi, len(pts) - 1):
             acc += math.dist(pts[i], pts[i + 1])
@@ -596,8 +666,13 @@ class PurePursuit(Node):
         lx = np.interp(idx, np.arange(len(sx)), sx)
         ly = np.interp(idx, np.arange(len(sy)), sy)
         dmin = np.min(np.hypot(px[:, None] - lx[None, :], py[:, None] - ly[None, :]), axis=1)
-        hw = self.g("cone_safety_half_width") if self.in_cone else self.g("safety_half_width")
-        hit = int(np.sum(dmin < hw))
+        if hw is None:
+            hw = self.g("cone_safety_half_width") if self.in_cone or self.avoid_obj is not None \
+                else self.g("safety_half_width")
+        inside = dmin < hw
+        hit = int(np.sum(inside))
+        if track and hit:
+            self.hit_c = (float(px[inside].mean()), float(py[inside].mean()))
         return hit if hit >= self.g("safety_min_points") else 0
 
     def track(self, pts, yaws, bi, d, ax, ay, yaw, v):

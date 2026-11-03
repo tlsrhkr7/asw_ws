@@ -9,6 +9,7 @@
 map→odom: odom 은 출발 위치에서 (0,0,0) 으로 시작하므로 start 프리셋 좌표를 그대로 map→odom 으로 발행한다.
   → 시뮬/실차 모두 차를 그 출발 위치에 놓고 시작해야 맞는다.
 """
+import os
 import sys
 
 from ament_index_python.packages import get_package_share_directory
@@ -27,12 +28,14 @@ def nodes(context):
     sim = lc("sim").lower() == "true"
     x, y, yaw = start_pose(lc("start"), lc("x"), lc("y"), lc("yaw"))
     common = {"use_sim_time": sim}
+    # 카메라 색 기준: 실차는 config/perception.yaml (현장에서 분석 창으로 맞춘 값). 시뮬은 렌더링 색이 달라 코드 기본값
+    perc = [os.path.join(get_package_share_directory("asw_bringup"), "config", "perception.yaml")] if not sim else []
     # map→odom: localizer:=true 면 카메라-맵 매칭으로 계속 보정, false 면 출발 위치로 고정
     localizer = lc("localizer").lower() == "true"
     # 출발 전 자리 맞추기: 카메라로 놓인 자리를 맞출 때까지 출발 안 함 (localizer 있을 때만)
     init_align = localizer and lc("init_align").lower() == "true"
     map_odom = (Node(package="asw_nav", executable="lane_localizer", output="screen",
-                     parameters=[common, {"init_x": x, "init_y": y, "init_yaw": yaw, "init_align": init_align}])
+                     parameters=[common, *perc, {"init_x": x, "init_y": y, "init_yaw": yaw, "init_align": init_align}])
                 if localizer else
                 Node(package="tf2_ros", executable="static_transform_publisher", name="map_to_odom",
                      arguments=["--x", str(x), "--y", str(y), "--yaw", str(yaw),
@@ -52,7 +55,7 @@ def nodes(context):
                                   "lookahead_min": float(lc("lookahead")), "wait_localizer": init_align,
                                   "lane_centering": lc("lane_centering").lower() == "true"}]),
         # 정지선 검출 (카메라): 실제 선 앞에 서기 + 정지선 순서로 구간 판단
-        Node(package="asw_nav", executable="stopline_detector", output="screen", parameters=[common]),
+        Node(package="asw_nav", executable="stopline_detector", output="screen", parameters=[common, *perc]),
         Node(package="asw_nav", executable="trail_recorder", output="screen",
              parameters=[common, {"tag": "mission" if mission else lc("path")}]),
     ] + ([Node(package="asw_nav", executable="nav_viewer", output="log",

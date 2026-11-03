@@ -7,8 +7,10 @@
 
   3 로터리 / 12 마지막 주정차: 해당 정지선에서 멈추면 갈림길 선택지마다 '그 길 경로 띠'(경로 좌우 branch_half_width)
           안의 라이다 점을 여러 번(decide_samples) 세서, 과반이 막힘이면 막힌 길 → 처음으로 열린 길 선택
-  5 추월: 4번 정지선에서 멈추면 라이다로 3차로 안 장애물을 찾아, 모든 장애물을 피하는 차로로 옮겨 타는 경로로 수정.
-          추월 구간을 달리는 동안 0.3초마다 다시 찾아서(앞 장애물에 가려졌던 것) 필요하면 다시 계획.
+  5 추월: 4번 정지선에 서 있는 동안 라이다로 3차로 안 장애물 후보를 모으고, decide_after 초가 지나면 한 번에
+          모든 장애물을 피하는 차로를 정함 (첫 장애물만 보고 성급히 정하지 않음).
+          달리는 동안에도 계속 다시 찾아서(가려졌던 것) 차로를 바꿔야 하면: 옮겨 타기 시작점이 아직 앞이면 그냥
+          다시 계획, 이미 지났으면 그 자리에 서서 '지금 위치 → 새 차로' 로 부드럽게 옮겨 가는 경로로 다시 계획.
 구간 판단: pure_pursuit 가 정지선에 설 때마다 내는 /pp/stop_event (몇 번째 정지선) 순서로 '지금 어느 정지선'인지 안다
   (missions.yaml stop_lines 순서 = 코스 순서). 위치가 몇 cm 틀려도 순서는 안 틀림. 이벤트가 없으면 맵 거리로 대신 판단.
 경로 전환은 현재 위치에서 이어지는 새 /plan 을 내는 방식 (pure_pursuit 는 새 경로를 받으면 그 점부터 추종).
@@ -67,6 +69,8 @@ class MissionManager(Node):
         self.ov_lane = self.cfg["overtake"]["base_lane"]     # 지금 계획된 추월 차로
         self.ov_seen = []                                   # 확정된 장애물 [(x, y, lane)]
         self.ov_cand = []                                   # 후보 [x, y, lane, 본 횟수]
+        self.ov_decided = False                             # 정지선에서 차로를 정했나
+        self.ov_start = None                                # 달리다 바꿀 때: (시작 x, 그때 옆 거리)
         self.ov_active = False
         self.dec_state = {d["name"]: {} for d in dec}       # 판단 결과 {선택지: "open"|"blocked"}
         self.ov_blocked = None                              # 추월: 막힌 차로 집합 (찾기 전 None)
@@ -161,8 +165,8 @@ class MissionManager(Node):
     # ---------------- 경로 ----------------
     def build_plan(self):
         pts = list(self.courses[self.route + self.final])
-        if self.ov_lane != self.cfg["overtake"]["base_lane"]:
-            pts = self.overtake_path(pts, self.ov_lane)
+        if self.ov_lane != self.cfg["overtake"]["base_lane"] or self.ov_start is not None:
+            pts = self.overtake_path(pts, self.ov_lane, self.ov_start)
         return pts
 
     def publish(self, pts, start=False, keep_stop=False):
@@ -335,6 +339,16 @@ class MissionManager(Node):
                 out.append((float(cx), float(cy), lane))
         return out
 
+    def path_clear(self, pts):
+        """경로가 확인된 추월 장애물 어느 것과도 obstacle_clear 안으로 안 지나가나 (추월 구간 점만)."""
+        o = self.cfg["overtake"]
+        lim = o.get("obstacle_clear", 0.24)            # 차 반폭 0.11 + 컵 덩어리 반폭 ~0.09 + 여유
+        for ox, oy, _ in self.ov_seen:
+            for x, y, d, _ in pts:
+                if d > 0 and abs(x - ox) < 0.6 and math.hypot(x - ox, y - oy) < lim:
+                    return False
+        return True
+
     def choose_lane(self, obs):
         o = self.cfg["overtake"]
         blocked = {lane for _, _, lane in obs}
@@ -344,22 +358,32 @@ class MissionManager(Node):
         # 가운데에 가까운 차로, 같으면 지금 계획된 차로 유지 (위/아래 흔들림 방지)
         return min(free, key=lambda k: (abs(k - o["base_lane"]), k != self.ov_lane, k))
 
-    def overtake_path(self, pts, lane):
-        """추월 구간 점들의 y 를 가운데 차로 → lane → 가운데 로 부드럽게(코사인) 옮긴다."""
+    def ov_a0(self):
+        o = self.cfg["overtake"]
+        xs_obs = [x for x, _, _ in self.ov_seen] or [3.8]
+        return max(o["x_min"], min(xs_obs) - o["clear"] - o["change_len"])
+
+    def overtake_path(self, pts, lane, start=None):
+        """추월 구간 점들의 y 를 가운데 차로 → lane → 가운데 로 부드럽게(코사인) 옮긴다.
+        start=(x, 옆 거리): 그 x 에서 그 옆 거리(지금 차 위치)부터 lane 으로 옮겨 감 (달리다 차로를 바꿀 때)."""
         o = self.cfg["overtake"]
         ly = o["lanes_y"]
         A = ly[lane] - ly[o["base_lane"]]
         xs_obs = [x for x, _, _ in self.ov_seen] or [3.8]
         L, clr = o["change_len"], o["clear"]
-        a0 = max(o["x_min"], min(xs_obs) - clr - L)            # 옮겨 타기 시작
-        b0 = min(o["x_max"] - L, max(xs_obs) + clr)            # 돌아오기 시작
+        a0, A0 = self.ov_a0(), 0.0                               # 옮겨 타기 시작, 시작 옆 거리
+        if start is not None:
+            a0, A0 = start
+        b0 = max(a0 + L, min(o["x_max"] - L, max(xs_obs) + clr))  # 돌아오기 시작
         y0, y1 = min(ly) - 0.25, max(ly) + 0.25                # 추월 구간 도로 (세 차로)
 
         def off(x):
-            if x <= a0 or x >= b0 + L:
+            if x >= b0 + L:
                 return 0.0
+            if x <= a0:
+                return A0
             if x < a0 + L:
-                return A * (1 - math.cos(math.pi * (x - a0) / L)) / 2
+                return A0 + (A - A0) * (1 - math.cos(math.pi * (x - a0) / L)) / 2
             if x <= b0:
                 return A
             return A * (1 + math.cos(math.pi * (x - b0) / L)) / 2
@@ -402,6 +426,12 @@ class MissionManager(Node):
                 self.ov_seen.append((c[0], c[1], c[2]))
                 new = True
         self.ov_n = getattr(self, "ov_n", 0) + 1
+        if not self.ov_decided:
+            # 정지선에 서 있는 동안은 모으기만, decide_after 초 지나면 (또는 이미 움직이면) 한 번에 결정
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if self.still_since is not None and now - self.still_since < self.cfg["overtake"].get("decide_after", 1.5):
+                return
+            self.ov_decided, new = True, True
         if not new:
             if self.ov_blocked is None and self.ov_n >= confirm + 2:     # 몇 장 봐도 없음 → 차로 전부 열림
                 self.ov_blocked = set()
@@ -411,9 +441,38 @@ class MissionManager(Node):
         self.ov_blocked = {ln for _, _, ln in self.ov_seen}
         names = ["위", "가운데", "아래"]
         desc = ", ".join(f"x{x:.2f} {names[ln]}" for x, _, ln in self.ov_seen)
+        keep, start = False, None
+        p = self.pose()
+        moving = self.still_since is None
+        o = self.cfg["overtake"]
+        if moving and p is not None and p[0] > self.ov_a0() - 0.15:
+            # 이미 옮겨 타기 시작점을 지남 → 바꾸려면 그 자리에 서서, 지금 위치에서 새 차로로 옮겨 가는 경로
+            start = (p[0], p[1] - o["lanes_y"][o["base_lane"]])
+        # 후보 차로를 선호 순서로 보며, 확인된 장애물과 안 부딪히는 경로만 (없으면 지금 계획 그대로 → 안전 정지가 멈춤)
+        base = self.courses[self.route + self.final]
+        prefer = [lane] + [k for k in sorted(range(len(o["lanes_y"])), key=lambda k: abs(k - o["base_lane"])) if k != lane]
+        pick = None
+        for k in prefer:
+            st = start if (k != self.ov_lane and start is not None) else self.ov_start
+            cand = self.overtake_path(base, k, st) if (k != o["base_lane"] or st is not None) else list(base)
+            if self.path_clear(cand):
+                pick = (k, st)
+                break
+        if pick is None:
+            self.ov_blocked = {ln for _, _, ln in self.ov_seen}
+            self.status(f"[5 추월] 장애물: {desc} → 부딪히지 않고 갈 길 없음, 지금 계획 유지 (막히면 안전 정지)")
+            self.publish_branches()
+            return
+        lane, st = pick
+        if lane == self.ov_lane and st == self.ov_start and self.ov_decided and not new:
+            return
+        if lane != self.ov_lane and st is not None and st is start:
+            keep = True
+            self.status(f"[5 추월] 달리는 중 차로 변경 → 서서 x{p[0]:.2f} 부터 다시 계획")
+        self.ov_start = st
         self.ov_lane = lane
         self.plan = self.build_plan()
-        self.publish(self.plan, keep_stop=False)        # 정차 중이면 pure_pursuit 가 남은 정차 시간 유지
+        self.publish(self.plan, keep_stop=keep)         # 정차 중이면 pure_pursuit 가 남은 정차 시간 유지
         self.status(f"[5 추월] 장애물: {desc} → {names[lane]} 차로로 통과")
         self.publish_branches()
 

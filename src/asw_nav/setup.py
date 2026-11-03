@@ -28,5 +28,8 @@ setup(
         "lane_localizer = asw_nav.lane_localizer:main",
         "mission_manager = asw_nav.mission_manager:main",
         "stopline_detector = asw_nav.stopline_detector:main",
+        "teleop_key = asw_nav.teleop_key:main",
+        "jpeg_tap = asw_nav.jpeg_tap:main",
+        "perception_review = asw_nav.perception_review:main",
     ]},
 )

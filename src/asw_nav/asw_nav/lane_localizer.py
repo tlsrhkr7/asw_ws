@@ -49,7 +49,7 @@ from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud
 from std_msgs.msg import Bool, Float32MultiArray, String
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
-from asw_nav import ground_proj
+from asw_nav import ground_proj, perception
 
 SIZE_M = 8.5
 
@@ -185,13 +185,10 @@ class LaneLocalizer(Node):
         hsv = cv2.cvtColor(np.ascontiguousarray(a), cv2.COLOR_BGR2HSV)
         h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
         g = self.g
-        yh = g("yellow_h")
-        yellow = (h > yh[0]) & (h < yh[1]) & (s > g("yellow_s_min")) & (v > g("yellow_v_min"))
-        white = (s < g("white_s_max")) & (v > g("white_v_min"))
+        white, yellow, gray = perception.color_masks(h, s, v, {k: g(k) for k in perception.COLOR_KEYS})
         m = yellow | white
         if g("use_gray"):
-            gv = g("gray_v")
-            m |= (s < g("gray_s_max")) & (v > gv[0]) & (v < gv[1])
+            m |= gray
         x, y, lane = gx[m], gy[m], (yellow | white)[m]
         if g("use_lidar_mask"):
             keep = self.not_behind_objects(x, y)

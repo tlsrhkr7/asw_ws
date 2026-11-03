@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """안전 정지 시험: 차가 trigger 선을 지나면 차 앞 경로 위에 사람(기둥)을 세웠다가 hold 초 뒤 치운다.
   ros2 run asw_sim spawn_person.py --ros-args -p use_sim_time:=true -p trigger_y:=0.5 -p x:=0.68 -p y:=1.15
-  (기본: 출발 직선, 차가 y 0.5 를 지나면 (0.68, 1.15) 에 6초)
+  (기본: 출발 직선, 차가 y 0.5 를 지나면 (0.68, 1.15) 에 6초. trigger_x > 0 이면 차가 그 x 를 지날 때.
+   hold 를 크게 주면 그대로 세워 둠 → 늦게 나타나는 장애물 시험)
 """
 import rclpy
 from gazebo_msgs.srv import DeleteEntity, SpawnEntity
@@ -19,7 +20,7 @@ SDF = """<?xml version="1.0"?><sdf version="1.6"><model name="test_person"><stat
 class Person(Node):
     def __init__(self):
         super().__init__("spawn_person")
-        for n, v in (("x", 0.68), ("y", 1.15), ("trigger_y", 0.5), ("hold", 6.0)):
+        for n, v in (("x", 0.68), ("y", 1.15), ("trigger_y", 0.5), ("trigger_x", 0.0), ("hold", 6.0)):
             self.declare_parameter(n, v)
         self.g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.cli_s = self.create_client(SpawnEntity, "/spawn_entity")
@@ -29,7 +30,10 @@ class Person(Node):
 
     def on_gt(self, m):
         now = self.get_clock().now().nanoseconds * 1e-9
-        if self.state == "wait" and m.pose.pose.position.y > self.g("trigger_y"):
+        tx = self.g("trigger_x")      # trigger_x > 0 이면 차가 그 x 를 (y > trigger_y 인 곳에서) 지날 때
+        px, py = m.pose.pose.position.x, m.pose.pose.position.y
+        trig = (px > tx and py > self.g("trigger_y")) if tx > 0 else py > self.g("trigger_y")
+        if self.state == "wait" and trig:
             self.cli_s.call_async(SpawnEntity.Request(name="test_person", xml=SDF.format(x=self.g("x"), y=self.g("y"))))
             self.get_logger().info(f"사람 등장 ({self.g('x')}, {self.g('y')})")
             self.state, self.t0 = "on", now

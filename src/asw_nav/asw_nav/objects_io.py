@@ -76,19 +76,34 @@ def load_cfg(path=None, scenario=None):
 
 
 def overtake_obstacles(o):
-    """추월 구간: count 개 덩어리, 각각 무작위 차로 + x 범위 안 무작위 위치 (seed 고정 → 같은 맵이면 같은 배치)."""
+    """추월 구간: count 개 덩어리 (seed 고정 → 같은 맵이면 같은 배치).
+    distinct_lanes: 덩어리마다 서로 다른 차로 (한 차로에 둘 안 둠 → 빈 차로가 늘 하나), x 는 x_window 안에서
+      간격 gap_range 로, 차로 안 좌우 lateral_jitter, 덩어리 방향 yaw_jitter [deg] 만큼 무작위.
+    아니면 예전 방식: 무작위 차로 + x_ranges[i] 안 위치, 차로 가운데·가로 방향."""
     rng = random.Random(o.get("seed", 0))
     out = []
-    for i in range(o.get("count", 2)):
-        lane = rng.randrange(len(o["lanes_y"]))
-        xr = o["x_ranges"][i % len(o["x_ranges"])]
-        x = rng.uniform(*xr)
-        y0 = o["lanes_y"][lane]
-        n, gap = o.get("cups_per_obstacle", 3), o.get("cup_gap", 0.06)
-        for k in range(n):                     # 차로를 가로질러(y 방향) 붙여 놓음
-            out.append({"kind": "cup", "name": f"ovt{i}_{k}", "x": x, "y": y0 + (k - (n - 1) / 2) * gap,
-                        "yaw": 0.0, "radius": o.get("radius", 0.03), "height": o.get("height", 0.17),
-                        "role": "overtake", "lane": lane, "group": i})
+    count, ly = o.get("count", 2), o["lanes_y"]
+    if o.get("distinct_lanes", False):
+        lanes = rng.sample(range(len(ly)), min(count, len(ly)))
+        x0, x1 = o.get("x_window", [3.65, 4.75])
+        g0, g1 = o.get("gap_range", [0.30, 1.00])
+        gap = rng.uniform(g0, min(g1, x1 - x0))
+        start = rng.uniform(x0, x1 - gap)
+        xs = [start + gap * i / max(1, len(lanes) - 1) for i in range(len(lanes))]
+        lat = [rng.uniform(-1, 1) * o.get("lateral_jitter", 0.06) for _ in lanes]
+        rot = [math.radians(rng.uniform(-1, 1) * o.get("yaw_jitter", 15.0)) for _ in lanes]
+    else:
+        lanes = [rng.randrange(len(ly)) for _ in range(count)]
+        xs = [rng.uniform(*o["x_ranges"][i % len(o["x_ranges"])]) for i in range(count)]
+        lat, rot = [0.0] * count, [0.0] * count
+    n, cgap = o.get("cups_per_obstacle", 3), o.get("cup_gap", 0.06)
+    for i, lane in enumerate(lanes):
+        cx, cy = xs[i], ly[lane] + lat[i]
+        for k in range(n):                     # 차로를 가로질러 붙여 놓음 (rot 만큼 비틀림)
+            t = (k - (n - 1) / 2) * cgap
+            out.append({"kind": "cup", "name": f"ovt{i}_{k}", "x": cx + math.sin(rot[i]) * t,
+                        "y": cy + math.cos(rot[i]) * t, "yaw": 0.0, "radius": o.get("radius", 0.03),
+                        "height": o.get("height", 0.17), "role": "overtake", "lane": lane, "group": i})
     return out
 
 

@@ -25,7 +25,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
-from asw_nav import ground_proj
+from asw_nav import ground_proj, perception
 
 
 def yaw_of(q):
@@ -45,11 +45,8 @@ class StoplineDetector(Node):
         p("max_angle", 25.0)          # 차와 선의 각도 [deg] 까지 찾음 (주정차 칸처럼 꺾어 들어가며 볼 때)
         p("confirm_dist", 0.04)       # 연속 두 장이 이 안에서 같은 곳이어야 확정 [m]
         p("pixel_step", 2)
-        p("white_s_max", 50)          # 흰색 HSV (lane_localizer 와 같은 기준, 현장에서 다시 맞춤)
-        p("white_v_min", 170)
-        p("yellow_h", [15, 40])       # 노란색 HSV (lane_localizer 와 같은 기준)
-        p("yellow_s_min", 80)
-        p("yellow_v_min", 100)
+        for k, val in perception.COLOR_KEYS.items():   # 색 기준 (config/perception.yaml 로 덮어씀)
+            p(k, val)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.g = g
         self.tfb = Buffer()
@@ -83,9 +80,8 @@ class StoplineDetector(Node):
         vs, us, gx, gy = self.lut
         hsv = cv2.cvtColor(np.ascontiguousarray(ground_proj.image_bgr(msg)), cv2.COLOR_BGR2HSV)
         h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
-        yh = self.g("yellow_h")
-        masks = {0: (s < self.g("white_s_max")) & (v > self.g("white_v_min")),
-                 1: (h > yh[0]) & (h < yh[1]) & (s > self.g("yellow_s_min")) & (v > self.g("yellow_v_min"))}
+        white, yellow, _ = perception.color_masks(h, s, v, {k: self.g(k) for k in perception.COLOR_KEYS})
+        masks = {0: white, 1: yellow}
         t = None
         for color, m in masks.items():
             found = self.find_line(gx[m], gy[m])
@@ -118,36 +114,8 @@ class StoplineDetector(Node):
 
     def find_line(self, x, y):
         """가장 가까운 가로선 → (차 중심에서 선까지 수직 거리 [m], 선 수직 방향의 차 기준 각도 [rad]). 없으면 None."""
-        if len(x) < 20:
-            return None
-        hb, th = self.g("band_half"), self.g("band_thick")
-        ny = int(round(2 * hb / 0.01))
-        yb = np.clip(((y + hb) / 0.01).astype(int), 0, ny - 1)
-        best = None
-        for ang in np.radians(np.arange(-self.g("max_angle"), self.g("max_angle") + 1e-9, 2.0)):
-            xr = x * math.cos(ang) + y * math.sin(ang)           # 선에 수직인 축으로 본 거리
-            lo = self.g("range_min")
-            nb = int((self.g("range_max") - lo) / 0.01) + 1
-            xb = np.clip(((xr - lo) / 0.01).astype(int), 0, nb - 1)
-            occ = np.zeros((nb, ny), bool)
-            occ[xb, yb] = True
-            w = max(1, int(round(th / 0.01)))
-            # 두께 w 칸 안에서 덮은 좌우 칸 비율
-            cum = np.zeros((nb + w, ny), bool)
-            for k in range(w):
-                cum[k:k + nb] |= occ
-            cov = cum[:nb].mean(axis=1)
-            hit = np.where(cov >= self.g("min_coverage"))[0]
-            if len(hit) and abs(ang) < math.radians(self.g("max_angle")) - 1e-6:   # 각도 한계에 붙은 건 비스듬한 옆 선
-                i = hit[0]                                       # 두께 창 [i-w+1, i] 안에 선이 있음
-                a0, a1 = lo + (i - w + 1) * 0.01, lo + (i + w + 1) * 0.01
-                sel = (xr >= a0) & (xr < a1)
-                d = float(np.median(xr[sel])) if sel.any() else lo + i * 0.01   # 그 근처 흰 점 가운데 = 선 중심
-                c = float(cov[i:i + w].max())
-                # 가장 가까운 선 중에서 좌우를 가장 잘 덮는 각도 (= 선과 맞는 각도)의 거리
-                if best is None or d < best[0] - 0.05 or (abs(d - best[0]) <= 0.05 and c > best[1]):
-                    best = (d, c, float(ang))
-        return (best[0], best[2]) if best else None
+        r = perception.find_line(x, y, {k: self.g(k) for k in perception.LINE_KEYS})
+        return (r[0], r[1]) if r else None
 
 
 def main():
