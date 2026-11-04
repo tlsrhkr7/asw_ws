@@ -6,3 +6,7 @@
   ros__parameters:
     wheel_speed_scale: 1.0
     steer_bias: 0.0
+    # 조향: 실제 곡률 / 보고 조향 기준 계산 곡률 (2026-11-05 녹화 3개, IMU 기준 0.46~0.51 → 0.48).
+    #  다시 재려면: 녹화 후 asw_review <bag> --odom (조향별 실제 회전 표). 기본값 = kinematics.CURV_GAIN
+    curv_gain: 0.48
+    # 조향 한계는 limo.launch 인자 max_inner_deg (기본 50, 섀시가 49.4° 에서 자름) / odom 방향은 limo.launch yaw_source (기본 imu)

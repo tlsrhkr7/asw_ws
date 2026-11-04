@@ -11,8 +11,16 @@ import math
 
 WHEELBASE = 0.200
 TRACK = 0.172
-MAX_INNER = 0.48869          # 28 deg
 ANGLE_SCALE = 2.47           # 하드웨어 조향 값 × 2.47 = 내측 조향각 [rad] (limo_driver.h left/right_angle_scale_)
+
+# 실차 조향 실측 (2026-11-05, 녹화 3개 6390 샘플, IMU 자이로 기준):
+#   섀시가 보고하는 내측 조향(= 보낸 값)으로 자전거 모델 곡률을 계산하면, 실제 곡률(IMU 요레이트/속도)은
+#   그 0.48 배 (조향 2°~45°, 속도 0.1~0.4 m/s 에서 일정). 한 바퀴 순 방향: IMU +3°, 바퀴 모델 odom −99°.
+#   → 원본 28° 한계로는 실제 회전반경 0.96 m (트랙 최소 0.8 m 못 돎). 보내는 한계를 45° 로 늘리면 0.60 m (확인).
+#   70° 를 보내면 섀시 펌웨어가 49.4° 에서 자름 → 한계 50°. 그때 실제 가운데 조향 24.5° (마루, 0.1 m/s, 반경 0.42~0.45 m)
+CURV_GAIN = 0.48             # 실제 곡률 / (보고 내측 조향으로 계산한 곡률). 드라이버가 원하는 회전 → 보낼 조향 환산에 씀
+HW_MAX_INNER = math.radians(50.0)   # 섀시에 보내는 내측 조향 한계 (펌웨어가 49.4° 에서 자름)
+MAX_CENTRAL_MEASURED = math.radians(24.5)   # 한계까지 꺾었을 때 실제 가운데 조향 (2026-11-05 실측, 계획·추종·시뮬 기준)
 
 
 def inner_to_central(inner):
@@ -28,18 +36,32 @@ def central_to_inner(central):
     return math.copysign(inner, central)
 
 
-MAX_CENTRAL = inner_to_central(MAX_INNER)   # ~0.408 rad
+def effective_central(hw_inner):
+    """섀시에 보낸 내측 조향 → 실제로 도는 등가 중앙 조향 (곡률 기준, CURV_GAIN 반영)."""
+    return math.atan(CURV_GAIN * math.tan(inner_to_central(hw_inner)))
 
 
-def cmd_to_inner(v, w):
-    """/cmd_vel (v, 요레이트 w) → 내측 조향각. 드라이버 twistCmdCallback 과 동일 (회전반경 하한, 28도 제한 포함)."""
+def hw_inner_for_central(central):
+    """실제로 내고 싶은 등가 중앙 조향 → 섀시에 보낼 내측 조향 (한계 전, CURV_GAIN 반영)."""
+    return central_to_inner(math.atan(math.tan(central) / CURV_GAIN))
+
+
+# 실제로 낼 수 있는 최대 (계획·추종·시뮬은 모두 이 '실제' 기준. 이상적 Ackermann 기하로 환산한 내측 = MAX_INNER)
+MAX_CENTRAL = MAX_CENTRAL_MEASURED              # 0.428 rad (24.5°), 최소 회전반경 WHEELBASE/tan ≈ 0.44 m
+MAX_INNER = central_to_inner(MAX_CENTRAL)       # ~0.52 rad (29.6°, 이상적 Ackermann 기하 환산 — 시뮬 차 한계)
+MIN_RADIUS = WHEELBASE / math.tan(MAX_CENTRAL)  # 뒤차축 기준 최소 회전반경 [m]
+
+
+def cmd_to_inner(v, w, max_inner=MAX_INNER):
+    """/cmd_vel (v, 요레이트 w) → 내측 조향각. 드라이버 twistCmdCallback 과 동일 (회전반경 하한, 조향 한계 포함).
+    max_inner: 실차 드라이버가 파라미터로 늘려 볼 수 있음 (원본 28도)."""
     if abs(w) < 1e-9:
         return 0.0
     r = v / w if abs(v) > 1e-9 else 0.0
     if abs(r) < TRACK / 2.0:
         r = math.copysign(TRACK / 2.0 + 0.01, w if r == 0.0 else r)
     inner = central_to_inner(math.atan(WHEELBASE / r))
-    return max(-MAX_INNER, min(MAX_INNER, inner))
+    return max(-max_inner, min(max_inner, inner))
 
 
 def cmd_to_central(v, w):

@@ -45,10 +45,15 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("port", default_value="/dev/ttyTHS0"),
-        DeclareLaunchArgument("yaw_source", default_value="wheel", description="wheel | imu"),
-        DeclareLaunchArgument("cam_pitch", default_value="0.0"),
+        DeclareLaunchArgument("yaw_source", default_value="imu",
+                              description="imu (기본, 실측상 정확) | wheel (보고 조향 × curv_gain)"),
+        # 카메라 아래로 숙인 각 [rad]. 2026-11-05 한 바퀴 녹화: 0° 로 계산하면 차로 폭 45~48 cm, 정지선 +12 cm 로
+        #  부풀려 보임 → 2.5°(0.0436) 에서 가까이·멀리 모두 40~41 cm (규정 400 mm). 다시 재기: 차로 가운데 곧게 녹화
+        DeclareLaunchArgument("cam_pitch", default_value="0.0436"),
         DeclareLaunchArgument("camera", default_value="true"),
         DeclareLaunchArgument("lidar", default_value="true"),
+        DeclareLaunchArgument("max_inner_deg", default_value="50.0",
+                              description="보내는 내측 조향 한계 [deg] (원본 28. 섀시 펌웨어가 49.4 에서 자름)"),
         DeclareLaunchArgument("cam_auto_exposure", default_value="true"),
         DeclareLaunchArgument("cam_exposure", default_value="-1"),   # -1 = 카메라 기본
         DeclareLaunchArgument("cam_gain", default_value="-1"),
@@ -58,6 +63,7 @@ def generate_launch_description():
         Node(package="asw_limo_base", executable="limo_driver", output="screen",
              parameters=[os.path.join(share, "config", "limo_calib.yaml"),     # 오도메트리 보정 (asw_review --odom)
                          {"port": LaunchConfiguration("port"),
+                          "max_inner_deg": ParameterValue(LaunchConfiguration("max_inner_deg"), value_type=float),
                           "yaw_source": LaunchConfiguration("yaw_source")}]),
         Node(package="robot_state_publisher", executable="robot_state_publisher", output="screen",
              parameters=[{"robot_description": robot_description}]),

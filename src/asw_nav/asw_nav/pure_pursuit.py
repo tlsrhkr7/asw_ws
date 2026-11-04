@@ -90,6 +90,7 @@ class PurePursuit(Node):
         p("cone_gap", 0.21)          # 한쪽 콘만 보일 때 그 콘에서 떨어질 거리 [m] (콘 반지름 포함 차 반폭 + 여유)
         p("cone_look", 1.0)          # 경로 앞 이 거리 안의 콘만 [m]
         p("cone_alpha", 0.3)         # 라이다 한 장마다 반영 비율
+        p("cone_lost_time", 0.5)     # 라이다 구간에서 이만큼 [s] 콘·벽을 못 보면 카메라 차선 맞추기로
         p("cone_line_clear", 0.14)   # 옮긴 경로에서 차 중심 ~ 맵 노란 선 최소 거리 [m] (차 반폭 0.11 + 3 cm)
         p("cone_line_look", 0.8)     # 이 거리 [m] 앞 경로까지 선 여유 확인 (차가 따라오는 동안 선 안 넘게)
         p("cone_safety_half_width", 0.13)   # 라바콘 구간 안전 정지 띠 반폭 (차 반폭 0.11 + 2 cm)
@@ -109,6 +110,13 @@ class PurePursuit(Node):
         p("stopline_tol", 0.5)       # 맵 기준 정차 위치와 이만큼 [m] 안의 선만 믿음 (넉넉하게)
         p("stopline_max_age", 15.0)  # 이보다 오래된 검출은 버림 [s] (주정차 칸 안에서 앞뒤로 오가는 동안 기억)
         p("stopline_fix_max", 0.30)
+        # 정지선에 다가가며 미리 앞뒤 위치 보정: 정지선이 카메라 앞 approach_range 안에서 approach_confirm 번 연속
+        #  (새 검출마다) '맵 남은 거리 − 카메라 남은 거리' 가 approach_agree 안으로 같으면 그 차이만큼 바로 보정.
+        #  (기존: 선 앞에 선 뒤에야 보정 → 정지선 직전 커브·판단 위치가 늦게 맞음). 서고 나면 남은 차이를 한 번 더
+        p("stopline_approach", True)
+        p("approach_range", [0.35, 1.20])   # 카메라 앞 거리 [m] (선 중심 기준 남은 거리 + stopline_offset)
+        p("approach_confirm", 3)
+        p("approach_agree", 0.03)    # [m]
         p("end_line_camera", False)  # 칸 끝 노란 가로선 보고 서기: 칸 안은 비슷한 선이 가까이 많아 잘못 잡을 수 있음 →
                                      #  기본 끔 (기동 중 위치 보정 멈춤 + 직전 정지선 보정으로 충분). 실차 칸 보고 다시 판단
         p("end_line_gap", 0.04)      # 경로 마지막(마지막 주정차 칸) 끝: 카메라로 본 노란 가로선 앞 범퍼 여유 [m]
@@ -143,8 +151,10 @@ class PurePursuit(Node):
         gl = objects_io.gray_line()
         self.gray = np.array(gl) if gl else None
         self.cone_off, self.in_cone, self.cone_stamp = 0.0, False, None
+        self.cone_seen_t = -1e9      # 라이다 구간에서 마지막으로 콘·벽을 본 시각 (못 보면 카메라 차선 맞추기로)
         self.line_dt, self.line_res = self.load_line_dt()
         self.sl_obs, self.sl_lock, self.sl_diff, self.stop_count = None, False, None, 0
+        self.ap_samples, self.ap_done, self.ap_stamp = [], False, None     # 다가가며 미리 보정
         self.end_obs_list, self.end_lock, self.end_cr_obs = [], False, None
         self.create_subscription(PointStamped, "/stopline", self.on_stopline, 10)
         self.pub_stop = self.create_publisher(String, "/pp/stop_event", 10)
@@ -180,6 +190,7 @@ class PurePursuit(Node):
         self.seg, self.idx, self.done = 0, 0, False
         self.wd_last, self.wd_dist = None, 0.0
         self.sl_lock, self.sl_diff, self.end_lock, self.end_cr_obs = False, None, False, None
+        self.ap_samples, self.ap_done, self.ap_stamp = [], False, None
         z0 = abs(msg.poses[0].pose.position.z) if msg.poses else 1.0
         now = self.get_clock().now()
         waiting = getattr(self, "pause_until", None) is not None and now < self.pause_until
@@ -212,6 +223,32 @@ class PurePursuit(Node):
         yaw = yaw_of(t.transform.rotation)
         dx, dy = obs[0] - t.transform.translation.x, obs[1] - t.transform.translation.y
         return dx * math.cos(yaw) + dy * math.sin(yaw) - offset
+
+    def approach_fix(self, cr, remain, yaw):
+        """정지선에 다가가는 중: 새 검출마다 (맵 남은 거리 − 카메라 남은 거리) 를 모아, 연속으로 같으면 그만큼 앞뒤 보정.
+        양수 = 맵 추정보다 실제로 더 와 있음 → 추정 위치를 앞으로."""
+        if not self.g("stopline_approach") or self.ap_done or self.sl_obs is None:
+            return
+        if self.sl_obs[2] == self.ap_stamp:                 # 같은 검출은 한 번만
+            return
+        self.ap_stamp = self.sl_obs[2]
+        lo, hi = self.g("approach_range")
+        ahead = cr + self.g("stopline_offset")              # 차 중심 → 선 중심
+        if not lo <= ahead <= hi:
+            return
+        diff = remain - cr
+        s = self.ap_samples + [diff]
+        if max(s) - min(s) > self.g("approach_agree"):      # 앞 것들과 안 맞으면 이번 것부터 다시 셈
+            s = [diff]
+        self.ap_samples = s
+        if len(s) < self.g("approach_confirm"):
+            return
+        self.ap_done = True
+        e = float(np.median(s))
+        if 0.01 < abs(e) < self.g("stopline_fix_max"):
+            self.pub_shift.publish(Vector3(x=e * math.cos(yaw), y=e * math.sin(yaw), z=0.0))
+            self.get_logger().info(f"정지선에 다가가며 앞뒤 위치 미리 보정 {e * 100:+.1f} cm (선까지 {ahead:.2f} m, "
+                                   f"{len(s)}번 연속 같음)")
 
     def stop(self):
         self.pub_cmd.publish(Twist())
@@ -286,6 +323,7 @@ class PurePursuit(Node):
             if cr is not None and (self.sl_lock or abs(cr - remain) < self.g("stopline_tol")):
                 if not self.sl_lock:
                     self.sl_lock, self.sl_diff = True, cr - remain
+                self.approach_fix(cr, remain, yaw)
                 remain, passed = max(cr, 0.0), cr < 0
         # 경로 마지막 전진 구간(마지막 주정차 칸): 카메라로 본 칸 끝 노란 가로선 앞에 섬 (맵이 몇 cm 틀려도 칸 안에)
         if self.g("end_line_camera") and d > 0 and self.seg == len(self.segs) - 1 and remain < 1.0:
@@ -318,6 +356,7 @@ class PurePursuit(Node):
                     {"n": self.stop_count, "camera": self.sl_lock,
                      "diff": round(self.sl_diff, 3) if self.sl_lock else None}, ensure_ascii=False)))
             self.sl_obs, self.sl_lock, self.sl_diff = None, False, None
+            self.ap_samples, self.ap_done, self.ap_stamp = [], False, None
             self.wd_last, self.wd_dist = None, 0.0
             if self.seg + 1 < len(self.segs):
                 self.seg, self.idx = self.seg + 1, 0
@@ -336,9 +375,15 @@ class PurePursuit(Node):
             seg_len0 = sum(math.dist(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
             if self.g("cone_centering"):
                 self.cone_update(pts, bi, rx, ry)
-            self.lane_update(pts, bi, self.g("lane_centering") and not self.in_cone
+            # 라이다 구간(라바콘·미로)이어도 콘·벽을 cone_lost_time 넘게 못 보면 (벽 없음·끊김) 카메라 차선 맞추기로
+            #  (2026-11-05 실차: 미로 벽 설치 전 → 라이다도 차선도 안 써서 선 밟음)
+            lidar_ok = self.in_cone and (self.get_clock().now().nanoseconds * 1e-9 - self.cone_seen_t
+                                         < self.g("cone_lost_time"))
+            if self.in_cone and not lidar_ok:
+                self.cone_off *= 0.95
+            self.lane_update(pts, bi, self.g("lane_centering") and not lidar_ok
                              and seg_len0 >= self.g("maneuver_length"))
-            base_off = self.cone_off if self.in_cone else self.lane_off
+            base_off = self.cone_off if lidar_ok else self.lane_off
             self.avoid_progress(rx, ry, yaw)
             pts0, pts = pts, self.shift_path(pts, bi, base_off + self.avoid_off)
 
@@ -432,6 +477,7 @@ class PurePursuit(Node):
                 self.cone_stamp = stamp
                 tgt = self.cone_target(pts, bi, rx, ry)
                 if tgt is not None:
+                    self.cone_seen_t = self.get_clock().now().nanoseconds * 1e-9
                     lim = self.g("cone_max_shift")
                     self.cone_off += self.g("cone_alpha") * (max(-lim, min(lim, tgt)) - self.cone_off)
         else:

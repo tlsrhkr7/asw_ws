@@ -11,10 +11,11 @@ map→odom: odom 은 출발 위치에서 (0,0,0) 으로 시작하므로 start �
 """
 import os
 import sys
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -35,7 +36,8 @@ def nodes(context):
     # 출발 전 자리 맞추기: 카메라로 놓인 자리를 맞출 때까지 출발 안 함 (localizer 있을 때만)
     init_align = localizer and lc("init_align").lower() == "true"
     map_odom = (Node(package="asw_nav", executable="lane_localizer", output="screen",
-                     parameters=[common, *perc, {"init_x": x, "init_y": y, "init_yaw": yaw, "init_align": init_align}])
+                     parameters=[common, *perc, {"init_x": x, "init_y": y, "init_yaw": yaw, "init_align": init_align,
+                                                  "lost_recovery": lc("lost_recovery").lower() == "true"}])
                 if localizer else
                 Node(package="tf2_ros", executable="static_transform_publisher", name="map_to_odom",
                      arguments=["--x", str(x), "--y", str(y), "--yaw", str(yaw),
@@ -47,7 +49,23 @@ def nodes(context):
                if mission else
                Node(package="asw_nav", executable="path_publisher", output="screen",
                     parameters=[common, {"path": lc("path")}]))
-    return [
+    # 실차 주행 녹화 (기본: 실차만): 나중에 노트북에서 위치 보정·카메라를 다시 돌려 보며 원인 분석·튜닝
+    rec = lc("record").lower()
+    rec_nodes = []
+    if rec == "true" or (rec == "auto" and not sim):
+        out = os.path.expanduser(f"~/asw_bags/{time.strftime('%Y%m%d_%H%M%S')}_drive")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        rec_nodes = [Node(package="asw_nav", executable="jpeg_tap", output="log", parameters=[common]),
+                     ExecuteProcess(cmd=["ros2", "bag", "record", "-o", out,
+                                         "/camera/color/image_jpeg", "/camera/color/camera_info", "/scan", "/odom", "/imu",
+                                         "/tf", "/tf_static", "/cmd_vel", "/limo/steering_inner", "/plan",
+                                         "/localizer/status", "/localizer/info", "/localizer/init", "/localizer/ready",
+                                         "/stopline", "/pp/stop_event", "/pp/cte", "/safety/stop", "/lane/offset",
+                                         "/cone/offset", "/mission/branches", "/mission/status", "/stopline/status",
+                                         "/pp/done", "/pp/maneuver", "/battery", "/lane/points", "/localizer/points"],
+                                    output="log")]
+        print(f"[drive] 녹화: {out}")
+    return rec_nodes + [
         map_odom,
         planner,
         Node(package="asw_nav", executable="pure_pursuit", output="screen",
@@ -84,6 +102,8 @@ def generate_launch_description():
                               description="카메라로 본 실제 차선 가운데로 경로 옮기기 (맵이 실제와 다를 때)"),
         DeclareLaunchArgument("init_align", default_value="true",
                               description="출발 전 카메라로 놓인 자리 맞추기 (끝날 때까지 출발 안 함). false: 프리셋 그대로 출발"),
+        DeclareLaunchArgument("record", default_value="auto", description="auto: 실차만 녹화 | true | false"),
+        DeclareLaunchArgument("lost_recovery", default_value="true", description="위치 잃었을 때 넓게 다시 찾기"),
         DeclareLaunchArgument("viewer", default_value="true",
                               description="true: 네비 창 / false: 없음 / headless: 창 없이 snapshot 만. "
                                           "실차는 LIMO에 화면이 없으니 false 로 띄우고 노트북에서 nav_viewer 실행"),

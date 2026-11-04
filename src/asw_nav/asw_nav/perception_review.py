@@ -10,7 +10,8 @@
   빨간 선 = 정지선 후보(흰 가로선), 주황 = 노란 가로선, 초록 = 차선 안쪽 가장자리 5 cm 조각마다
   (진한 초록 = 양쪽 폭 맞음, 연한 = 한쪽만, 빨강 = 양쪽인데 폭 틀림 → 반사·가짜 선 의심),
   보라 네모 = 넓은 밝은 덩어리(반사광·테이프 의심, 2 cm 선이 아님)
-키: SPACE 재생/멈춤, d/a 한 장 앞/뒤, w/s 50장 앞/뒤, t 전체 통계(지금 색 기준), p 색 기준 저장(perception.yaml), q 종료
+검출 방식: tophat (기본, 위에서 본 바닥에서 주변보다 밝은 좁은 띠 = 반사에 강함) / hsv (예전 절대 밝기). m 키로 바꿔 비교
+키: SPACE 재생/멈춤, d/a 한 장 앞/뒤, w/s 50장 앞/뒤, m 방식 바꾸기, t 전체 통계(지금 기준), p 기준 저장(perception.yaml), q 종료
 막대: 색 기준(HSV). 바꾸면 바로 다시 계산.
 통계: 차선 인식률(달리는 동안), 차선 못 본 가장 긴 시간, 정지선 후보 위치 묶음(odom), 덩어리 나온 비율.
 """
@@ -24,10 +25,18 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 
-from asw_nav import ground_proj, perception
+from asw_nav import ground_proj, perception, perception_bev
 
-TRACK = [("white_s_max", 255), ("white_v_min", 255), ("yellow_h_lo", 179), ("yellow_h_hi", 179),
-         ("yellow_s_min", 255), ("yellow_v_min", 255), ("gray_s_max", 255), ("gray_v_lo", 255), ("gray_v_hi", 255)]
+# 막대: (이름, 최대, 값 = 막대 × 배율, 넣을 키[, 리스트 칸])  — tophat 방식 먼저, 그 아래 예전 hsv 방식
+TRACK = [("white_dv", 120, 1, "white_dv"), ("white_s_max_th", 255, 1, "white_s_max_th"),
+         ("yellow_dv", 120, 1, "yellow_dv"), ("gray_dv", 120, 1, "gray_dv"),
+         ("tophat_w_cm", 20, 0.01, "tophat_w"), ("seam_dv", 150, 1, "seam_dv"),
+         ("line_min_len_cm", 40, 0.01, "line_min_len"),
+         ("yellow_h_lo", 179, 1, "yellow_h", 0), ("yellow_h_hi", 179, 1, "yellow_h", 1),
+         ("yellow_s_min", 255, 1, "yellow_s_min"), ("gray_s_max", 255, 1, "gray_s_max"),
+         ("hsv_white_s_max", 255, 1, "white_s_max"), ("hsv_white_v_min", 255, 1, "white_v_min"),
+         ("hsv_yellow_v_min", 255, 1, "yellow_v_min"),
+         ("hsv_gray_v_lo", 255, 1, "gray_v", 0), ("hsv_gray_v_hi", 255, 1, "gray_v", 1)]
 VIEW_X, VIEW_Y, PXM = 1.6, 0.8, 300      # 위에서 본 그림: 앞 1.6 m, 좌우 ±0.8 m, 300 px/m
 
 
@@ -59,8 +68,10 @@ class Bag:
         r.open(rosbag2_py.StorageOptions(uri=path, storage_id="sqlite3"),
                rosbag2_py.ConverterOptions(input_serialization_format="cdr", output_serialization_format="cdr"))
         types = {t.name: t.type for t in r.get_all_topics_and_types()}
-        want = {"/camera/color/image_jpeg", "/camera/color/camera_info", "/tf_static", "/odom", "/cmd_vel"}
+        want = {"/camera/color/image_jpeg", "/camera/color/camera_info", "/tf_static", "/odom", "/cmd_vel",
+                "/imu", "/limo/steering_inner"}
         self.frames, self.info, self.static, self.odom, self.cmd = [], None, {}, [], []
+        self.gyro, self.steer, self.odom_v = [], [], []   # (t, 자이로 z), (t, 보고 내측 조향), odom 속도(뒤차축)
         while r.has_next():
             topic, data, t = r.read_next()
             if topic not in want:
@@ -77,8 +88,13 @@ class Bag:
             elif topic == "/odom":
                 p = m.pose.pose
                 self.odom.append((t, p.position.x, p.position.y, yaw_of(p.orientation)))
+                self.odom_v.append(m.twist.twist.linear.x)
             elif topic == "/cmd_vel":
                 self.cmd.append((t, m.linear.x, m.angular.z))
+            elif topic == "/imu":
+                self.gyro.append((t, m.angular_velocity.z))
+            elif topic == "/limo/steering_inner":
+                self.steer.append((t, m.data))
         self.odom_t = [o[0] for o in self.odom]
         self.cmd_t = [c[0] for c in self.cmd]
         if not self.frames or self.info is None:
@@ -146,6 +162,43 @@ def odom_report(bag):
                    f"steer_bias 로 보정, 실제는 곧았으면 odom 쪽 치우침")
     else:
         out.append("조향 0 으로 곧게 전진한 구간이 1 초 미만 → 조향 치우침은 못 봄 (A/D 안 누르고 곧게 2 m 이상 가 보기)")
+    return out + steer_report(bag)
+
+
+def steer_report(bag):
+    """조향 실측: 보고 내측 조향이 0.3 초 동안 일정하고 달리는 샘플에서, 계산 곡률 대비 실제 곡률(IMU 요레이트/속도).
+    → limo_calib.yaml curv_gain. 한 바퀴 순 방향 변화(IMU vs odom)도."""
+    from asw_limo_base import kinematics as kin
+    if len(bag.gyro) < 10 or len(bag.steer) < 10 or len(bag.odom) < 10:
+        return ["조향 실측: /imu 또는 /limo/steering_inner 없음"]
+    gy, st = np.array(bag.gyro), np.array(bag.steer)
+    od = np.array([(o[0], o[1], o[2], o[3]) for o in bag.odom])
+    v, t = np.abs(np.array(bag.odom_v)), od[:, 0]          # 뒤차축 속도 (자전거 모델 곡률 = 요레이트 / 이 속도)
+    rows = []
+    for k in range(0, len(t), 2):
+        if v[k] < 0.08:
+            continue
+        win = st[(st[:, 0] > t[k] - 0.3) & (st[:, 0] <= t[k]), 1]
+        if len(win) < 5 or np.ptp(win) > math.radians(2) or abs(win[-1]) < math.radians(5):
+            continue
+        g = gy[min(np.searchsorted(gy[:, 0], t[k]), len(gy) - 1), 1]
+        calc = math.tan(kin.inner_to_central(float(win[-1]))) / kin.WHEELBASE
+        rows.append((math.degrees(abs(win[-1])), (g / v[k]) / calc if calc else np.nan))
+    out = []
+    if len(rows) > 20:
+        r = np.array(rows)
+        out.append(f"조향 실측 ({len(r)} 샘플, 보고 조향 5° 이상·일정): 실제 곡률 / 계산 곡률 = {np.nanmedian(r[:, 1]):.3f} "
+                   f"→ limo_calib.yaml curv_gain (지금 kinematics {kin.CURV_GAIN})")
+        for lo in (5, 15, 25, 35, 45, 55):
+            s = r[(r[:, 0] >= lo) & (r[:, 0] < lo + 10)]
+            if len(s) > 10:
+                out.append(f"    보고 {lo}~{lo + 10}°: {np.nanmedian(s[:, 1]):.3f} ({len(s)})")
+    else:
+        out.append("조향 실측: 조향을 일정하게 준 채 달린 구간이 적음 (A/D 를 누른 채 원을 돌아 보기)")
+    gyro_net = float(np.sum(gy[1:, 1] * np.diff(gy[:, 0])))
+    odom_net = float(np.unwrap(od[:, 3])[-1] - np.unwrap(od[:, 3])[0])
+    out.append(f"순 방향 변화: IMU 자이로 {math.degrees(gyro_net):+.0f}°, odom {math.degrees(odom_net):+.0f}° "
+               f"(한 바퀴 돌아 같은 방향이면 0 에 가까워야. 차이가 크면 odom 방향이 틀림)")
     return out
 
 
@@ -154,22 +207,33 @@ class Review:
         self.bag, self.p = bag, dict(params)
         tf = bag.cam_tf()
         self.lut = ground_proj.build_lut(bag.info, tf, 2, 0.20, VIEW_X, VIEW_Y)
+        self.be = perception_bev.BirdsEye(bag.info, tf, 0.01, (0.20, VIEW_X), VIEW_Y)
         self.cam_h = self.lut[4]
         self.line_p = dict(perception.LINE_KEYS)
 
     def analyze(self, i):
+        """한 장 → 색별 (바닥 x, y, 영상 u, v) 점 + 정지선·차선·덩어리. 방식은 self.p['detect'] (tophat | hsv)."""
         t, jpg = self.bag.frames[i]
         img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-        vs, us, gx, gy, _ = self.lut
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
-        white, yellow, gray = perception.color_masks(h, s, v, self.p)
-        line = white | yellow
-        r = SimpleNamespace(t=t, img=img, white=white, yellow=yellow, gray=gray)
-        r.stop = perception.find_line(gx[white], gy[white], self.line_p)
-        r.ystop = perception.find_line(gx[yellow], gy[yellow], self.line_p)
-        r.lane = perception.lane_check(gx[line], gy[line])
-        r.blobs = perception.blobs(gx[white], gy[white])
+        r = SimpleNamespace(t=t, img=img, bev=None, pts={})
+        if self.p.get("detect", "tophat") == "tophat":
+            be = self.be
+            r.bev = be.warp(img)
+            masks = perception_bev.tophat_masks(r.bev, be.valid, self.p)[:3]
+            for name, m in zip(("white", "yellow", "gray"), masks):
+                r.pts[name] = (be.gx[m], be.gy[m], be.mapx[m].astype(int), be.mapy[m].astype(int))
+        else:
+            vs, us, gx, gy, _ = self.lut
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            masks = perception.color_masks(hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2], self.p)
+            for name, m in zip(("white", "yellow", "gray"), masks):
+                r.pts[name] = (gx[m], gy[m], us[m], vs[m])
+        wx, wy = r.pts["white"][:2]
+        yx, yy = r.pts["yellow"][:2]
+        r.stop = perception.find_line(wx, wy, self.line_p)
+        r.ystop = perception.find_line(yx, yy, self.line_p)
+        r.lane = perception.lane_check(np.concatenate([wx, yx]), np.concatenate([wy, yy]))
+        r.blobs = perception.blobs(wx, wy)
         r.speed = self.bag.speed_at(t)
         r.pose = self.bag.pose_at(t)
         return r
@@ -177,22 +241,26 @@ class Review:
     # ---------------- 그림 ----------------
     def render(self, i):
         r = self.analyze(i)
-        vs, us, gx, gy, _ = self.lut
         cam = r.img.copy()
-        for m, col in ((r.gray, (200, 60, 200)), (r.white, (255, 255, 0)), (r.yellow, (0, 0, 255))):
+        for name, col in (("gray", (200, 60, 200)), ("white", (255, 255, 0)), ("yellow", (0, 0, 255))):
+            us, vs = r.pts[name][2], r.pts[name][3]
             for dv in (0, 1):
                 for du in (0, 1):
-                    cam[np.clip(vs[m] + dv, 0, cam.shape[0] - 1), np.clip(us[m] + du, 0, cam.shape[1] - 1)] = col
+                    cam[np.clip(vs + dv, 0, cam.shape[0] - 1), np.clip(us + du, 0, cam.shape[1] - 1)] = col
         H, W = int(VIEW_X * PXM), int(2 * VIEW_Y * PXM)
         bev = np.full((H, W, 3), 25, np.uint8)
+        if r.bev is not None:                                    # 위에서 본 바닥 영상을 어둡게 밑에 깜 (1 cm/px → 3 px)
+            bg = cv2.resize(r.bev, None, fx=PXM / 100, fy=PXM / 100, interpolation=cv2.INTER_NEAREST) // 2
+            bev[:bg.shape[0], :bg.shape[1]] = np.maximum(bev[:bg.shape[0], :bg.shape[1]], bg[:H, :W])
 
         def px(x, y):
             return int(W / 2 - y * PXM), int(H - x * PXM)
         for d in np.arange(0.2, VIEW_X, 0.2):                     # 20 cm 눈금
             cv2.line(bev, px(d, -VIEW_Y), px(d, VIEW_Y), (50, 50, 50), 1)
             cv2.putText(bev, f"{d:.1f}", px(d, VIEW_Y - 0.02), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (90, 90, 90), 1)
-        for m, col in ((r.gray, (150, 60, 150)), (r.white, (230, 230, 230)), (r.yellow, (0, 200, 255))):
-            u, v = (W / 2 - gy[m] * PXM).astype(int), (H - gx[m] * PXM).astype(int)
+        for name, col in (("gray", (150, 60, 150)), ("white", (230, 230, 230)), ("yellow", (0, 200, 255))):
+            gx, gy = r.pts[name][:2]
+            u, v = (W / 2 - gy * PXM).astype(int), (H - gx * PXM).astype(int)
             ok = (u >= 0) & (u < W) & (v >= 0) & (v < H)
             bev[v[ok], u[ok]] = col
         lane = r.lane
@@ -213,7 +281,7 @@ class Review:
         cv2.rectangle(bev, px(0.161, -0.11), px(-0.161, 0.11), (200, 200, 200), 1)   # 차 (앞 범퍼 0.161)
         bev = cv2.resize(bev, (int(W * 480 / H), 480))
         out = np.hstack([cam, bev])
-        txt = [f"{i + 1}/{len(self.bag.frames)}  t {r.t - self.bag.frames[0][0]:6.1f} s"
+        txt = [f"[{self.p.get('detect', 'tophat')}]  {i + 1}/{len(self.bag.frames)}  t {r.t - self.bag.frames[0][0]:6.1f} s"
                + (f"  cmd {r.speed:+.2f} m/s" if r.speed is not None else "") + f"  cam h {self.cam_h:.3f} m",
                ("정지선 후보 " + (f"{r.stop[0]:.2f} m, {math.degrees(r.stop[1]):+.0f} deg, 덮음 {r.stop[2]:.2f}"
                                if r.stop else "없음"))
@@ -326,6 +394,7 @@ def put_text(img, lines, org):
 
 def load_params(path):
     p = dict(perception.COLOR_KEYS)
+    p.update(perception_bev.TOPHAT_KEYS)
     if path and os.path.exists(path):
         import yaml
         d = yaml.safe_load(open(path, encoding="utf-8")) or {}
@@ -346,6 +415,17 @@ def save_params(path, p):
     yellow_v_min: {p['yellow_v_min']}
     gray_s_max: {p['gray_s_max']}         # 회색 선(라바콘 구간): 채도 이하 + 밝기 범위
     gray_v: [{p['gray_v'][0]}, {p['gray_v'][1]}]
+    # 반사에 강한 방식 (perception_bev): 위에서 본 바닥에서 '주변보다 밝은 좁은 띠'만 선
+    detect: {p['detect']}         # tophat | hsv (예전 절대 밝기)
+    tophat_w: {p['tophat_w']:.2f}         # 이보다 좁은 밝은 띠만 선 [m]
+    white_dv: {p['white_dv']}           # 흰 선: 주변보다 밝기 이만큼 이상
+    white_s_max_th: {p['white_s_max_th']}     # 흰 선: 채도 이하
+    yellow_dv: {p['yellow_dv']}          # 노란 선: 주변보다 이만큼 이상 (색 조건과 함께)
+    gray_dv: {p['gray_dv']}            # 회색 선: 주변보다 이만큼 이상
+    seam_dv: {p['seam_dv']}            # 검은 이음매: 주변보다 이만큼 어두운 좁은 띠 근처는 제외 (0 = 끔)
+    seam_pad: {p['seam_pad']:.2f}
+    line_min_len: {p['line_min_len']:.2f}     # 선 조각 최소 길이 [m]
+    line_max_width: {p['line_max_width']:.2f}   # 선 조각 평균 폭 최대 [m]
 """
     open(path, "w", encoding="utf-8", newline="\n").write(txt)
 
@@ -367,10 +447,13 @@ def main():
     ap.add_argument("--snapshot", default=None, help="이 그림 파일로 한 장 저장하고 끝")
     ap.add_argument("--frame", type=int, default=0)
     ap.add_argument("--odom", action="store_true", help="오도메트리 보정값(간 거리, 조향 치우침)만")
+    ap.add_argument("--detect", choices=["tophat", "hsv"], default=None, help="검출 방식 (기본: 색 기준 파일 값)")
     a = ap.parse_args([x for x in sys.argv[1:] if not x.startswith("--ros-args")])
     ypath = a.yaml or default_yaml()
     bag = Bag(os.path.expanduser(a.bag))
     rv = Review(bag, load_params(ypath))
+    if a.detect:
+        rv.p["detect"] = a.detect
     print(f"영상 {len(bag.frames)}장, odom {len(bag.odom)}개, 색 기준 파일 {ypath}")
     if a.odom:
         print("\n".join(odom_report(bag)))
@@ -383,22 +466,25 @@ def main():
         cv2.imwrite(a.snapshot, rv.render(min(a.frame, len(bag.frames) - 1)))
         return
 
-    win = "perception review (SPACE play, a/d step, t stats, p save, q quit)"
+    win = "perception review (SPACE play, a/d step, m tophat/hsv, t stats, p save, q quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    vals = {"white_s_max": rv.p["white_s_max"], "white_v_min": rv.p["white_v_min"],
-            "yellow_h_lo": rv.p["yellow_h"][0], "yellow_h_hi": rv.p["yellow_h"][1],
-            "yellow_s_min": rv.p["yellow_s_min"], "yellow_v_min": rv.p["yellow_v_min"],
-            "gray_s_max": rv.p["gray_s_max"], "gray_v_lo": rv.p["gray_v"][0], "gray_v_hi": rv.p["gray_v"][1]}
-    for k, mx in TRACK:
-        cv2.createTrackbar(k, win, int(vals[k]), mx, lambda _v: None)
+    for tr in TRACK:
+        v = rv.p[tr[3]] if len(tr) == 4 else rv.p[tr[3]][tr[4]]
+        cv2.createTrackbar(tr[0], win, int(round(v / tr[2])), tr[1], lambda _v: None)
     i, play, last = a.frame, False, None
     while True:
-        cur = {k: cv2.getTrackbarPos(k, win) for k, _ in TRACK}
-        rv.p = {"white_s_max": cur["white_s_max"], "white_v_min": cur["white_v_min"],
-                "yellow_h": [cur["yellow_h_lo"], cur["yellow_h_hi"]], "yellow_s_min": cur["yellow_s_min"],
-                "yellow_v_min": cur["yellow_v_min"], "gray_s_max": cur["gray_s_max"],
-                "gray_v": [cur["gray_v_lo"], cur["gray_v_hi"]]}
-        key_now = (i, tuple(sorted(cur.items())))
+        cur = {tr[0]: cv2.getTrackbarPos(tr[0], win) for tr in TRACK}
+        p = dict(rv.p)
+        p["yellow_h"], p["gray_v"] = list(p["yellow_h"]), list(p["gray_v"])
+        for tr in TRACK:
+            val = cur[tr[0]] * tr[2] if tr[2] != 1 else cur[tr[0]]
+            if len(tr) == 4:
+                p[tr[3]] = val
+            else:
+                p[tr[3]][tr[4]] = val
+        p["tophat_w"] = max(p["tophat_w"], 0.03)
+        rv.p = p
+        key_now = (i, p["detect"], tuple(sorted(cur.items())))
         if key_now != last:
             cv2.imshow(win, rv.render(i))
             last = key_now
@@ -415,6 +501,9 @@ def main():
             i = min(i + 50, len(bag.frames) - 1)
         elif k == ord("s"):
             i = max(i - 50, 0)
+        elif k == ord("m"):
+            rv.p["detect"] = "hsv" if rv.p["detect"] == "tophat" else "tophat"
+            print(f"검출 방식: {rv.p['detect']}")
         elif k == ord("t"):
             print("\n".join(rv.stats(max(1, len(bag.frames) // 600))))
         elif k == ord("p"):

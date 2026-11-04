@@ -67,12 +67,16 @@ class LimoDriver(Node):
         p("odom_frame", "odom")
         p("base_frame", "base_link")
         p("publish_tf", True)
-        p("yaw_source", "wheel")        # wheel: 조향각+속도 자전거 모델, imu: 자이로 z
+        p("yaw_source", "imu")          # imu: 자이로 z (기본, 실측상 정확) / wheel: 보고 조향+속도 자전거 모델 × curv_gain
         p("gyro_bias_calib", True)      # 정지 중(바퀴 속도 0) 자이로 바이어스 추정해서 빼기
         p("cmd_timeout", 0.5)           # /cmd_vel 끊기면 정지
         p("max_speed", 1.0)
         p("wheel_speed_scale", 1.0)     # 실측 보정: 실제 이동거리 / odom 거리
         p("steer_bias", 0.0)            # 실측 보정: 직진 시 odom 요레이트가 0 되도록 [rad, 중앙각]
+        # 조향 (2026-11-05 실측, kinematics.CURV_GAIN 설명): 실제 곡률 = 보고 조향으로 계산한 곡률 × curv_gain(0.48).
+        #  /cmd_vel 요레이트는 '실제' 회전 → 그 곡률을 내려면 curv_gain 으로 나눈 만큼 더 꺾어서 보냄 (한계 max_inner_deg)
+        p("curv_gain", kin.CURV_GAIN)
+        p("max_inner_deg", math.degrees(kin.HW_MAX_INNER))   # 보내는 내측 조향 한계 [deg] (원본 AgileX 28, 45 확인)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.odom_frame, self.base_frame = g("odom_frame"), g("base_frame")
 
@@ -119,7 +123,10 @@ class LimoDriver(Node):
             v, w = 0.0, 0.0
         vmax = self.get_parameter("max_speed").value
         v = max(-vmax, min(vmax, v))
-        steer_hw = kin.cmd_to_inner(v, w) / kin.ANGLE_SCALE
+        lim = math.radians(self.get_parameter("max_inner_deg").value)
+        central = kin.inner_to_central(kin.cmd_to_inner(v, w, max_inner=1.5))     # 원하는 실제 등가 중앙 조향
+        hw = kin.central_to_inner(math.atan(math.tan(central) / self.get_parameter("curv_gain").value))
+        steer_hw = max(-lim, min(lim, hw)) / kin.ANGLE_SCALE
         # data: linear(mm/s) angular lateral steering(×1000)
         self.send(make_frame(MSG_MOTION_COMMAND,
                              i16_bytes(v * 1000) + [0, 0, 0, 0] + i16_bytes(steer_hw * 1000)))
@@ -185,7 +192,7 @@ class LimoDriver(Node):
         if dt <= 0 or dt > 0.5:
             return
         v *= self.get_parameter("wheel_speed_scale").value
-        central = kin.inner_to_central(inner) + self.get_parameter("steer_bias").value
+        central = math.atan(self.get_parameter("curv_gain").value * math.tan(kin.inner_to_central(inner)))             + self.get_parameter("steer_bias").value
         gyro_z = self.gyro_est.update(self.gyro[2], v, dt) if self.get_parameter("gyro_bias_calib").value \
             else self.gyro[2]
         w = gyro_z if self.get_parameter("yaw_source").value == "imu" else kin.yaw_rate(v, central)

@@ -26,7 +26,9 @@ from asw_nav.path_io import save  # noqa: E402
 N, SIZE_M = 850, 8.5
 MAPS = os.path.join(REPO, "src/asw_sim/maps")
 LANE_HALF = 0.20          # 선 안쪽 가장자리 ~ 차로 중앙 [m]
-MIN_RADIUS = 0.46         # LIMO 최소 회전반경 (wheelbase / tan(중앙 최대 조향))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "asw_limo_base"))
+from asw_limo_base import kinematics as _kin  # noqa: E402
+MIN_RADIUS = _kin.MIN_RADIUS   # LIMO 실제 최소 회전반경 (실측 0.60 m, kinematics. 예전 이상적 기하 0.46)
 HALF_W = 0.11             # 차체 반폭 (LIMO Pro 폭 220 mm)
 MIN_CLEAR = 0.03          # 차체 가장자리 ~ 선 최소 여유
 

@@ -4,6 +4,7 @@
   ros2 launch asw_bringup record.launch.py                 # 섀시+센서+키보드 조종 창+녹화
   ros2 launch asw_bringup record.launch.py name:=night1    # 저장 이름 (~/asw_bags/<날짜>_<name>)
   ros2 launch asw_bringup record.launch.py name:=fixexp cam_auto_exposure:=false cam_exposure:=150   # 노출 고정 비교
+  ros2 launch asw_bringup record.launch.py name:=steer45 max_inner_deg:=45   # 조향 한계 바꿔 시험 (기본 50)
   ros2 launch asw_bringup record.launch.py sim:=true       # 시뮬 (sim.launch 를 먼저), 노트북 시험용
   → 노트북: asw_review <bag 폴더>   (scripts/asw_env.sh)
 
@@ -35,10 +36,11 @@ def nodes(context):
     if not sim:
         acts.append(IncludeLaunchDescription(PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory("asw_bringup"), "launch", "limo.launch.py")),
-            launch_arguments={k: lc(k) for k in CAM_ARGS}.items()))
+            launch_arguments={k: lc(k) for k in list(CAM_ARGS) + ["max_inner_deg"]}.items()))
     acts.append(Node(package="asw_nav", executable="jpeg_tap", output="screen", parameters=[common]))
     if lc("teleop").lower() == "true":
-        acts.append(Node(package="asw_nav", executable="teleop_key", output="screen", parameters=[common]))
+        acts.append(Node(package="asw_nav", executable="teleop_key", output="screen",
+                         parameters=[common, {"max_inner_deg": float(lc("max_inner_deg"))}]))
     acts.append(ExecuteProcess(cmd=["ros2", "bag", "record", "-o", out] + TOPICS,
                                output="screen"))
     print(f"[record] 저장: {out}")
@@ -51,6 +53,7 @@ def generate_launch_description():
         DeclareLaunchArgument("teleop", default_value="true"),
         DeclareLaunchArgument("name", default_value=""),
         DeclareLaunchArgument("dir", default_value="~/asw_bags"),
+        DeclareLaunchArgument("max_inner_deg", default_value="50.0"),   # 조향 한계 [deg] (드라이버·조종 창 같이)
         *[DeclareLaunchArgument(k, default_value=v) for k, v in CAM_ARGS.items()],   # limo.launch 카메라 노출 인자
         OpaqueFunction(function=nodes),
     ])

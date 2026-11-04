@@ -24,7 +24,10 @@ from asw_nav.path_io import save  # noqa: E402
 L = 0.200                   # wheelbase
 BODY_L, BODY_W = 0.322, 0.220      # LIMO Pro 스펙 길이 322 x 폭 220 mm
 MARGIN = 0.03               # 차체 둘레 여유 [m] (Gazebo 추종 오차 수 cm 에서도 선에 안 닿게)
-MAX_STEER = 0.408 * 0.85    # 계획에 쓰는 중앙 조향 최대 [rad]: 실제 최대(0.408)의 85% → 추종 보정 여유
+sys.path.insert(0, os.path.join(REPO, "src", "asw_limo_base"))
+from asw_limo_base import kinematics as kin  # noqa: E402
+MAX_STEER = kin.MAX_CENTRAL * 0.85    # 계획 중앙 조향 최대 [rad]: 실차 실측 최대(kinematics, 0.32)의 85% → 추종 보정 여유
+                                      # (2026-11-05 전: 이상적 기하 0.408 기준이었음 — 실차는 그만큼 못 돎)
 DS = 0.05                   # 한 걸음 [m]
 XY_RES, YAW_RES = 0.025, math.radians(5)
 REV_COST, SWITCH_COST, STEER_COST = 1.5, 0.6, 0.05

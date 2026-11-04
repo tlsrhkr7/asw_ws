@@ -42,6 +42,7 @@ class TeleopKey(Node):
         p("steer_rate", 2.5)       # 조향 막대 변화 [1/s] (0 → 끝까지 0.4 초)
         p("center_rate", 4.0)      # 떼면 가운데로 [1/s]
         p("rate", 50.0)
+        p("max_inner_deg", math.degrees(kin.HW_MAX_INNER))   # 섀시 조향 한계 [deg] (limo_driver max_inner_deg 와 같게)
         self.g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.speed, self.steer = 0.0, 0.0       # [m/s], -1(오른쪽)~1(왼쪽)
@@ -49,8 +50,13 @@ class TeleopKey(Node):
     def publish(self):
         c = Twist()
         c.linear.x = float(self.speed)
-        c.angular.z = float(self.speed * math.tan(self.steer * kin.MAX_CENTRAL) / kin.WHEELBASE)
+        c.angular.z = float(self.speed * math.tan(self.steer * self.max_central()) / kin.WHEELBASE)
         self.pub.publish(c)
+
+    def max_central(self):
+        """끝까지 꺾었을 때 실제로 도는 등가 중앙 조향 (드라이버가 curv_gain 으로 나눠 그 한계까지 꺾음)."""
+        hw = math.radians(self.g("max_inner_deg"))
+        return kin.MAX_CENTRAL if hw >= kin.HW_MAX_INNER - 1e-6 else min(kin.MAX_CENTRAL, kin.effective_central(hw))
 
 
 def bar(screen, font, x, y, w, frac, col, label, centered=False):
@@ -78,8 +84,11 @@ def draw(screen, font, big, node, focused):
     bar(screen, font, 20, 80, W - 40, v / lim if lim > 0 else 0.0, ORANGE if rev else GREEN,
         f"SPEED {v:+.2f} m/s  {'REVERSE' if rev else ''}", centered=True)
     # 조향 막대: 화면 왼쪽 = 왼쪽 조향
-    deg = math.degrees(node.steer * kin.MAX_CENTRAL)
-    bar(screen, font, 20, 160, W - 40, -node.steer, BLUE, f"STEER {deg:+.1f} deg (center)", centered=True)
+    deg = math.degrees(node.steer * node.max_central())
+    hw = math.degrees(kin.hw_inner_for_central(node.steer * node.max_central()))
+    r = kin.WHEELBASE / math.tan(abs(node.steer * node.max_central())) if abs(node.steer) > 0.02 else float("inf")
+    bar(screen, font, 20, 160, W - 40, -node.steer, BLUE,
+        f"STEER real {deg:+.1f} deg (R {r:.2f} m) / wheel {hw:+.1f} deg", centered=True)
     for i, t in enumerate(["W accel   S brake->reverse   A/D steer (hold)",
                            "1/2/3 = 0.1/0.2/0.3 m/s   R = reverse   SPACE stop   ESC quit"]):
         screen.blit(font.render(t, True, GRAY), (20, H - 60 + 24 * i))

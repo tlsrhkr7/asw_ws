@@ -25,7 +25,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 
-from asw_nav import ground_proj, perception
+from asw_nav import ground_proj, perception, perception_bev
 
 
 def yaw_of(q):
@@ -47,11 +47,13 @@ class StoplineDetector(Node):
         p("pixel_step", 2)
         for k, val in perception.COLOR_KEYS.items():   # 색 기준 (config/perception.yaml 로 덮어씀)
             p(k, val)
+        for k, val in perception_bev.TOPHAT_KEYS.items():   # 반사에 강한 방식 (실차 config/perception.yaml 에서 켬)
+            p(k, "hsv" if k == "detect" else val)
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.g = g
         self.tfb = Buffer()
         TransformListener(self.tfb, self)
-        self.info, self.img, self.lut, self.last_stamp = None, None, None, None
+        self.info, self.img, self.lut, self.last_stamp, self.be = None, None, None, None, None
         self.prev = {0: None, 1: None}                   # 색마다 바로 전 후보 (연속 두 장 확인)
         self.create_subscription(CameraInfo, "/camera/color/camera_info", lambda m: setattr(self, "info", m), 5)
         self.create_subscription(Image, "/camera/color/image_raw", lambda m: setattr(self, "img", m),
@@ -77,14 +79,22 @@ class StoplineDetector(Node):
             vs, us, gx, gy, _ = ground_proj.build_lut(self.info, tf, self.g("pixel_step"), self.g("range_min"),
                                                       self.g("range_max"), self.g("band_half"))
             self.lut = (vs, us, gx, gy)
-        vs, us, gx, gy = self.lut
-        hsv = cv2.cvtColor(np.ascontiguousarray(ground_proj.image_bgr(msg)), cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
-        white, yellow, _ = perception.color_masks(h, s, v, {k: self.g(k) for k in perception.COLOR_KEYS})
-        masks = {0: white, 1: yellow}
+            # top-hat 은 주변 바닥과 비교하므로 띠보다 넓게 (좌우 0.3 m)
+            self.be = perception_bev.BirdsEye(self.info, tf, 0.01, (self.g("range_min"), self.g("range_max")), 0.30)
+        img = np.ascontiguousarray(ground_proj.image_bgr(msg))
+        if self.g("detect") == "tophat":
+            p = {k: self.g(k) for k in list(perception.COLOR_KEYS) + list(perception_bev.TOPHAT_KEYS)}
+            white, yellow, _, _ = perception_bev.tophat_masks(self.be.warp(img), self.be.valid, p)
+            pts = {0: perception_bev.points(self.be, white), 1: perception_bev.points(self.be, yellow)}
+        else:
+            vs, us, gx, gy = self.lut
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
+            white, yellow, _ = perception.color_masks(h, s, v, {k: self.g(k) for k in perception.COLOR_KEYS})
+            pts = {0: (gx[white], gy[white]), 1: (gx[yellow], gy[yellow])}
         t = None
-        for color, m in masks.items():
-            found = self.find_line(gx[m], gy[m])
+        for color, (px_, py_) in pts.items():
+            found = self.find_line(px_, py_)
             if found is None:
                 self.prev[color] = None
                 continue

@@ -10,7 +10,10 @@ def test_inner_central_roundtrip():
 
 
 def test_max_central():
-    assert abs(kin.MAX_CENTRAL - 0.408) < 0.002
+    # 실차 실측 (한계 50°, 실제 최대 가운데 조향 24.5°) → 최소 회전반경 ~0.44 m
+    assert abs(kin.MAX_CENTRAL - math.radians(24.5)) < 1e-9
+    assert abs(kin.MIN_RADIUS - 0.44) < 0.01
+    assert abs(kin.effective_central(kin.hw_inner_for_central(0.2)) - 0.2) < 1e-9
 
 
 def test_cmd_yaw_rate_consistent():

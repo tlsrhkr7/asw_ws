@@ -1,11 +1,23 @@
-# 카메라 선 검출 색 기준 (HSV, OpenCV: H 0~179, S·V 0~255). lane_localizer·stopline_detector 공용.
-# 현장에서: 녹화(record.launch) → 노트북 분석 창(perception_review)에서 맞추고 s 키 → 이 파일 저장 → asw_build
+# 카메라 선 검출 색 기준 (HSV, OpenCV: H 0~179, S·V 0~255). lane_localizer·stopline_detector 공용. 실차에만 적용.
+# 현장에서: 녹화(record.launch) → 노트북 분석 창(asw_review)에서 맞추고 p 키 → 이 파일 저장 → deploy
 /**:
   ros__parameters:
     white_s_max: 50        # 흰 선: 채도 이하
     white_v_min: 170       #        밝기 이상
     yellow_h: [15, 40]     # 노란 선: 색상 범위
-    yellow_s_min: 80
+    yellow_s_min: 25       # 2026-11-05 실차 녹화: 반사로 노란 선이 채도 20~80 으로 바램 (흰 선은 0~10) → 80 이면 노랑이 흰색으로 잡힘
     yellow_v_min: 100
     gray_s_max: 40         # 회색 선(라바콘 구간): 채도 이하 + 밝기 범위
     gray_v: [60, 140]
+    # 반사에 강한 방식 (perception_bev): 위에서 본 바닥에서 '주변보다 밝은 좁은 띠'만 선
+    #  (2026-11-05 연습 맵: 조명 반사로 검은 도화지가 흰색으로 보여 hsv 방식은 출발 자리 맞추기부터 실패)
+    detect: tophat         # tophat | hsv (예전 절대 밝기)
+    tophat_w: 0.08         # 이보다 좁은 밝은 띠만 선 [m]
+    white_dv: 30           # 흰 선: 주변보다 밝기 이만큼 이상
+    white_s_max_th: 80     # 흰 선: 채도 이하
+    yellow_dv: 10          # 노란 선: 주변보다 이만큼 이상 (색 조건과 함께)
+    gray_dv: 25            # 회색 선: 주변보다 이만큼 이상
+    seam_dv: 40            # 검은 이음매: 주변보다 이만큼 어두운 좁은 띠 근처는 제외 (0 = 끔)
+    seam_pad: 0.02
+    line_min_len: 0.10     # 선 조각 최소 길이 [m]
+    line_max_width: 0.06   # 선 조각 평균 폭 최대 [m]

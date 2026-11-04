@@ -45,11 +45,11 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, LaserScan, PointCloud
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, LaserScan, PointCloud
 from std_msgs.msg import Bool, Float32MultiArray, String
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
-from asw_nav import ground_proj, perception
+from asw_nav import ground_proj, perception, perception_bev
 
 SIZE_M = 8.5
 
@@ -84,6 +84,22 @@ class LaneLocalizer(Node):
         p("pixel_step", 3)            # 영상 샘플 간격 [px]
         p("max_cost", 0.025)          # 보정 후 평균 거리가 이보다 크면 반영 안 함 [m]
         p("min_inlier", 0.5)          # 맵 선 2 cm 안 점 비율이 이보다 작으면 반영 안 함
+        # 위치 잃었을 때 넓게 다시 찾기 (2026-11-05 실차: 보정 70% 거부, 최대 4.4 m 를 보정 없이 감 → 추정 위치가
+        #  ±search_xy 밖으로 벗어나면 다시 못 찾고 점점 멀어짐). 보정 못 한 지 lost_after 초 넘으면 넓게 찾되,
+        #  아주 잘 맞을 때만(잘못된 선에 맞추는 것 방지) 크게 반영
+        p("lost_recovery", True)
+        p("lost_after", 1.5)          # [s]
+        p("lost_search_xy", 0.25)     # [m] (2 cm 간격)
+        p("lost_search_yaw", 10.0)    # [deg]
+        p("lost_max_cost", 0.015)     # 보정 후 선과 평균 거리 이하 [m]
+        p("lost_min_inlier", 0.6)     # 선 2 cm 안 점 비율 이상
+        p("lost_min_gain", 0.01)      # 지금보다 이만큼 [m] 이상 나아져야
+        p("lost_gain", 0.7)           # 한 번에 반영 비율
+        p("lost_max_step_xy", 0.05)   # [m]
+        p("lost_max_step_yaw", 2.0)   # [deg]
+        p("lost_confirm", 2)          # 넓게 찾은 결과가 이만큼 장 연속으로 같은 쪽을 가리킬 때만 반영 (한 장 우연 일치 오탐 방지)
+        p("lost_agree_xy", 0.03)      # 연속 결과끼리 이 안이면 같은 쪽 [m]
+        p("lost_agree_yaw", 1.5)      # [deg]
         p("occlusion_margin", 0.02)   # 라이다 물체 거리 + 이만큼 보다 먼 카메라 점 제거 [m] (밑동은 남김)
         p("use_lidar_mask", True)
         p("map_margin", 0.03)         # 맵 가장자리에서 이만큼 안쪽 점만 사용 [m]
@@ -96,6 +112,8 @@ class LaneLocalizer(Node):
         p("gray_s_max", 40)
         p("gray_v", [60, 140])
         p("use_gray", True)           # 회색 선(라바콘 구간)을 쓸지. 검은 바닥이 회색으로 잡히면 false
+        for k, val in perception_bev.TOPHAT_KEYS.items():   # 반사에 강한 방식 (실차 config/perception.yaml 에서 켬)
+            p(k, "hsv" if k == "detect" else val)
         # 출발 전 자리 맞추기
         p("init_align", True)
         p("init_search_xy", 0.12)     # [m]
@@ -113,6 +131,8 @@ class LaneLocalizer(Node):
         self.corr = np.array([g("init_x"), g("init_y"), g("init_yaw")])   # map→odom (x, y, yaw)
         self.ready = not (g("enable") and g("init_align"))
         self.init_ok, self.init_t0, self.last_stamp, self.init_reason = 0, None, None, ""
+        self.last_ok_t, self.n_recover = None, 0         # 마지막으로 위치 보정한 시각 (위치 잃음 판단)
+        self.lost_cand = []                              # 넓게 찾은 결과 연속 확인용 [(dx, dy, dyaw)]
 
         maps = os.path.join(get_package_share_directory("asw_sim"), "maps")
         m = None
@@ -134,15 +154,23 @@ class LaneLocalizer(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_ready = self.create_publisher(Bool, "/localizer/ready", latched)
         self.pub_lane = self.create_publisher(PointCloud, "/lane/points", 5)
+        # 디버그 창 오른쪽 위: 위에서 본 바닥(1 cm/px, 위 = 앞) + 검출 선 (흰 = 하늘색, 노랑 = 빨강, 회색 = 보라,
+        #  라이다로 가려 버린 점 = 어둡게). debug_every 장마다 JPEG 로 (창이 없으면 아무도 안 받음)
+        self.declare_parameter("debug_every", 3)
+        self.pub_dbg = self.create_publisher(CompressedImage, "/localizer/debug/compressed", 2)
+        self.dbg_n = 0
         self.pub_init = self.create_publisher(String, "/localizer/init", latched)          # 네비 창 표시용 (영문)
         self.pub_ready.publish(Bool(data=self.ready))
         if not self.ready:
             self.pub_init.publish(String(data="START ALIGN: waiting for camera"))
-        self.info, self.lut, self.img = None, None, None
+        self.info, self.lut, self.img, self.be = None, None, None, None
         self.scan = None
         self.create_subscription(LaserScan, "/scan", lambda m_: setattr(self, "scan", m_), qos_profile_sensor_data)
         self.create_subscription(CameraInfo, "/camera/color/camera_info", self.on_info, 5)
         self.create_subscription(Vector3, "/localizer/shift", self.on_shift, 10)
+        # 디버그 창(nav_viewer)에서: 출발 자리 손으로 맞추기 (맵 좌표 dx, dy [m], z = dyaw [rad]) / 지금 자리로 출발
+        self.create_subscription(Vector3, "/localizer/nudge", self.on_nudge, 10)
+        self.create_subscription(Bool, "/localizer/force_start", self.on_force_start, 10)
         self.maneuver = False
         self.speed, self.still_since, self.still_fixed = 0.0, None, False
         self.create_subscription(Odometry, "/odom", self.on_odom, 20)
@@ -175,25 +203,59 @@ class LaneLocalizer(Node):
         vs, us, gx, gy, cam_h = ground_proj.build_lut(self.info, tf, self.g("pixel_step"),
                                                       self.g("range_min"), self.g("range_max"), 0.8)
         self.lut = (vs, us, gx, gy)
+        self.be = perception_bev.BirdsEye(self.info, tf, 0.01, (self.g("range_min"), self.g("range_max")), 0.8)
+        # (디버그 영상 격자: 행 = range_max 에서 1 cm 씩 가까이, 열 = 왼쪽 0.8 m 에서 오른쪽으로)
+        self.get_logger().info(f"선 검출 방식: {self.g('detect')}")
         self.get_logger().info(f"바닥 투영표: {len(gx)} 픽셀 (x {self.g('range_min')}~{self.g('range_max')} m), "
                                f"카메라 높이 {cam_h:.3f} m")
 
     # ---------------- 선 픽셀 추출 ----------------
     def line_points(self, msg):
-        vs, us, gx, gy = self.lut
-        a = ground_proj.image_bgr(msg)
-        hsv = cv2.cvtColor(np.ascontiguousarray(a), cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
         g = self.g
-        white, yellow, gray = perception.color_masks(h, s, v, {k: g(k) for k in perception.COLOR_KEYS})
+        a = np.ascontiguousarray(ground_proj.image_bgr(msg))
+        if g("detect") == "tophat":                    # 반사에 강한 방식: 위에서 본 바닥에서 주변보다 밝은 좁은 띠
+            p = {k: g(k) for k in list(perception.COLOR_KEYS) + list(perception_bev.TOPHAT_KEYS)}
+            white, yellow, gray, _ = perception_bev.tophat_masks(self.be.warp(a), self.be.valid, p)
+            gx, gy = self.be.gx, self.be.gy
+        else:
+            vs, us, gx, gy = self.lut
+            hsv = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+            h, s, v = hsv[vs, us, 0], hsv[vs, us, 1], hsv[vs, us, 2]
+            white, yellow, gray = perception.color_masks(h, s, v, {k: g(k) for k in perception.COLOR_KEYS})
         m = yellow | white
         if g("use_gray"):
             m |= gray
-        x, y, lane = gx[m], gy[m], (yellow | white)[m]
-        if g("use_lidar_mask"):
-            keep = self.not_behind_objects(x, y)
-            x, y, lane = x[keep], y[keep], lane[keep]
+        x, y, lane = gx[m].astype(np.float32), gy[m].astype(np.float32), (yellow | white)[m]
+        keep = self.not_behind_objects(x, y) if g("use_lidar_mask") else np.ones(len(x), bool)
+        self.publish_debug(msg, a, gx[yellow], gy[yellow], gx[white], gy[white], gx[gray], gy[gray],
+                           x[~keep], y[~keep])
+        x, y, lane = x[keep], y[keep], lane[keep]
         return x, y, lane
+
+    def publish_debug(self, msg, a, yx, yy, wx, wy, gx_, gy_, hx, hy):
+        self.dbg_n += 1
+        if self.dbg_n % max(1, self.g("debug_every")) or self.pub_dbg.get_subscription_count() == 0:
+            return
+        if self.be is None:
+            return
+        H, W = self.be.gx.shape
+        x1, yh = float(self.be.gx[0, 0]), float(self.be.gy[0, 0])     # 맨 위 = 가장 먼 앞, 맨 왼쪽 = 가장 왼쪽
+        img = self.be.warp(a) // 2
+
+        def put(px_, py_, col):
+            r = ((x1 - px_) / 0.01).astype(int)
+            c = ((yh - py_) / 0.01).astype(int)
+            ok = (r >= 0) & (r < H) & (c >= 0) & (c < W)
+            img[r[ok], c[ok]] = col
+        put(gx_, gy_, (200, 60, 200))
+        put(wx, wy, (255, 255, 0))
+        put(yx, yy, (0, 0, 255))
+        put(hx, hy, (60, 60, 60))                          # 라이다 물체 뒤라 버린 점
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            out = CompressedImage(header=msg.header, format="jpeg")
+            out.data = buf.tobytes()
+            self.pub_dbg.publish(out)
 
     def not_behind_objects(self, x, y):
         """라이다가 물체를 본 방향(1도 단위)에서 그 물체 밑동보다 먼 바닥 점 = 물체 몸통 또는 그 뒤 → 버림."""
@@ -265,14 +327,25 @@ class LaneLocalizer(Node):
         if (not init) and self.maneuver and not still_fix:      # 기동 중 움직이는 동안: 보정 쉼
             self.status("hold (기동 중)")
             return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self.last_ok_t is None:
+            self.last_ok_t = now
+        lost = (not init and not still_fix and self.g("lost_recovery")
+                and now - self.last_ok_t > self.g("lost_after"))
+        step = 0.01
         if init:
             sx, syaw = self.g("init_search_xy"), math.radians(self.g("init_search_yaw"))
         elif still_fix:
             sx, syaw = self.g("still_search_xy"), math.radians(self.g("still_search_yaw"))
+        elif lost:
+            sx, syaw, step = self.g("lost_search_xy"), math.radians(self.g("lost_search_yaw")), 0.02
+            if len(mx) > 400:                                  # 넓게 찾을 땐 점을 줄여 계산량 맞춤
+                k = np.random.default_rng(1).choice(len(mx), 400, replace=False)
+                mx, my = mx[k], my[k]
         else:
             sx, syaw = self.g("search_xy"), math.radians(self.g("search_yaw"))
-        pen_w = self.g("init_penalty") if init else self.g("penalty")
-        dxy = np.arange(-sx, sx + 1e-9, 0.01)
+        pen_w = self.g("init_penalty") if init else (0.02 if lost else self.g("penalty"))
+        dxy = np.arange(-sx, sx + 1e-9, step)
         dths = np.arange(-syaw, syaw + 1e-9, math.radians(1.0))
         best = (1e9, 0.0, 0.0, 0.0)
         base = None
@@ -314,16 +387,59 @@ class LaneLocalizer(Node):
             if cost <= self.g("still_max_cost") and inlier >= self.g("still_min_inlier") and base - cost > 0.002:
                 self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
                 self.apply(bx, by, ddx, ddy, dth, 1.0)
+                self.last_ok_t = now
                 self.status(f"still-fix dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg")
             else:
                 self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+            return
+        if lost and base - cost < self.g("lost_min_gain") and cost <= self.g("max_cost") \
+                and inlier >= self.g("min_inlier"):
+            lost = False                                         # 넓게 찾아도 지금 자리가 이미 잘 맞음 → 안 잃음
+        if lost:                                                 # 위치 잃음: 넓게 찾은 결과가 아주 잘 맞을 때만
+            good = cost <= self.g("lost_max_cost") and inlier >= self.g("lost_min_inlier") \
+                and base - cost >= self.g("lost_min_gain")
+            # 연속 확인: 바로 전 후보와 같은 쪽(lost_agree 안)이면 쌓고, 아니면 이번 것부터 다시 셈
+            if good:
+                pv = self.lost_cand[-1] if self.lost_cand else None
+                same = pv is not None and math.hypot(ddx - pv[0], ddy - pv[1]) <= self.g("lost_agree_xy") \
+                    and abs(math.degrees(dth - pv[2])) <= self.g("lost_agree_yaw")
+                self.lost_cand = (self.lost_cand if same else []) + [(ddx, ddy, dth)]
+            else:
+                self.lost_cand = []
+            if good and len(self.lost_cand) < self.g("lost_confirm"):
+                self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+                self.status(f"LOST {now - self.last_ok_t:.1f}s candidate {len(self.lost_cand)}/{self.g('lost_confirm')} "
+                            f"dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm")
+                return
+            if good:
+                self.lost_cand = []
+                self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
+                gn = self.g("lost_gain")
+                sxy = math.hypot(ddx, ddy) * gn
+                if sxy > self.g("lost_max_step_xy"):
+                    gn *= self.g("lost_max_step_xy") / sxy
+                dth_lim = math.radians(self.g("lost_max_step_yaw"))
+                if abs(dth * gn) > dth_lim:
+                    dth = math.copysign(dth_lim / gn, dth)
+                self.apply(bx, by, ddx, ddy, dth, gn)
+                gap, self.last_ok_t = now - self.last_ok_t, now
+                self.n_recover += 1
+                self.status(f"RECOVER dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg "
+                            f"cost {base * 100:.1f}->{cost * 100:.1f}cm inlier={inlier:.0%}")
+                self.get_logger().info(f"위치 잃음 → 넓게 다시 찾아 맞춤 ({gap:.1f}초 만에): "
+                                       f"x {ddx * 100:+.0f} y {ddy * 100:+.0f} cm {math.degrees(dth):+.1f}°",
+                                       throttle_duration_sec=1.0)
+            else:
+                self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+                self.status(f"LOST {now - self.last_ok_t:.1f}s cost={cost * 100:.1f}cm inlier={inlier:.0%}")
             return
         if cost > self.g("max_cost") or inlier < self.g("min_inlier"):
             self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
             self.status(f"reject points={len(px)} cost={cost * 100:.1f}cm inlier={inlier:.0%}")
             return
-        if base - cost < 0.002:
+        if base - cost < 0.002:                                  # 이미 잘 맞음 (고칠 것 없음) = 위치 확인된 것
             self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+            self.last_ok_t, self.lost_cand = now, []
             self.status(f"keep points={len(px)} cost={base * 100:.1f}cm")
             return
         self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
@@ -335,6 +451,7 @@ class LaneLocalizer(Node):
         if abs(dth * gn) > dth_lim:
             dth = math.copysign(dth_lim / gn, dth)
         self.apply(bx, by, ddx, ddy, dth, gn)
+        self.last_ok_t, self.lost_cand = now, []
         self.status(f"corr dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg "
                     f"points={len(px)} cost {base * 100:.1f}->{cost * 100:.1f}cm")
 
@@ -353,6 +470,34 @@ class LaneLocalizer(Node):
         """다른 노드가 확인한 위치 보정 (정지선 앞 정차 → 앞뒤): 차 추정 위치를 맵에서 (x, y) 만큼 옮김."""
         self.corr = np.array([self.corr[0] + m.x, self.corr[1] + m.y, self.corr[2]])
         self.status(f"shift dx={m.x * 100:+.1f}cm dy={m.y * 100:+.1f}cm (정지선)")
+
+    def on_nudge(self, m):
+        """손으로 맞추기: 차 위치 기준으로 회전 m.z + 평행이동 (m.x, m.y). 출발 전에만."""
+        if self.ready:
+            return
+        try:
+            t = self.tfb.lookup_transform("map", "base_link", Time())
+            bx, by = t.transform.translation.x, t.transform.translation.y
+        except Exception:  # noqa: BLE001
+            return
+        self.apply(bx, by, m.x, m.y, m.z, 1.0)
+        dx, dy, dyaw = self.offset_from_preset()
+        self.init_ok = 0
+        self.pub_init.publish(String(data=f"START ALIGN: manual dx {dx * 100:+.0f} dy {dy * 100:+.0f} cm "
+                                          f"dyaw {dyaw:+.1f} deg (g = go)"))
+
+    def on_force_start(self, m):
+        """맵이 실제와 달라 자동 맞추기가 안 될 때: 지금 추정 위치(프리셋 + 손 맞춤)로 출발 허용."""
+        if not m.data or self.ready:
+            return
+        dx, dy, dyaw = self.offset_from_preset()
+        self.ready = True
+        self.last_ok_t = self.get_clock().now().nanoseconds * 1e-9
+        self.pub_ready.publish(Bool(data=True))
+        self.pub_init.publish(String(data=f"START ALIGN OK: forced (dx {dx * 100:+.0f} dy {dy * 100:+.0f} cm "
+                                          f"dyaw {dyaw:+.1f} deg)"))
+        self.get_logger().warn(f"출발 자리 맞추기 건너뜀 (디버그 창 g): 프리셋 대비 x {dx * 100:+.1f} cm, y {dy * 100:+.1f} cm, "
+                               f"방향 {dyaw:+.1f}°")
 
     def apply(self, bx, by, ddx, ddy, dth, gn):
         """맵 좌표에서 차 위치 기준 (dth, ddx, ddy) × gn 만큼 옮기는 보정 → map→odom 에 합성."""
@@ -389,6 +534,7 @@ class LaneLocalizer(Node):
             self.pub_init.publish(String(data=f"START ALIGN: matching ({self.init_ok}/{need})"))
             return
         self.ready = True
+        self.last_ok_t = self.get_clock().now().nanoseconds * 1e-9
         self.pub_ready.publish(Bool(data=True))
         self.pub_init.publish(String(data=f"START ALIGN OK: dx {dx * 100:+.1f}cm dy {dy * 100:+.1f}cm "
                                           f"dyaw {dyaw:+.1f}deg (match {cost * 100:.1f}cm)"))

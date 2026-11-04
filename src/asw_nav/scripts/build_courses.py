@@ -31,6 +31,20 @@ def join(parts):
         gap = math.dist(pts[-1][:2], nxt[0][:2])
         if gap > 0.10:
             sys.exit(f"{p}: 시작점이 앞 경로 끝에서 {gap * 100:.1f} cm 떨어짐")
+        if 0.005 < gap and pts[-1][2] > 0 and nxt[0][2] > 0:
+            # 같은 방향(전진)으로 이어지는데 몇 cm 어긋남 → 앞 경로 끝 0.6 m 를 다음 경로 시작점으로 서서히 끌어옴
+            #  (끊긴 계단 대신 매끄럽게. 예: 차로 중심선 → T 주차 진입점 2 cm)
+            dx, dy = nxt[0][0] - pts[-1][0], nxt[0][1] - pts[-1][1]
+            acc, k = 0.0, len(pts) - 1
+            while k > 0 and acc < 0.6:
+                acc += math.dist(pts[k][:2], pts[k - 1][:2])
+                k -= 1
+            for j in range(k, len(pts)):
+                s = sum(math.dist(pts[i][:2], pts[i + 1][:2]) for i in range(j, len(pts) - 1))
+                w = max(0.0, 1.0 - s / max(acc, 1e-6))
+                x, y, d, yaw = pts[j]
+                pts[j] = (x + dx * w, y + dy * w, d, yaw)
+            gap = 0.0
         nxt = nxt[1:] if gap < 0.01 else nxt
         x, y, d, yaw = nxt[0]
         nxt[0] = (x, y, 2 if d > 0 else -2, yaw)

@@ -24,6 +24,9 @@
   - 시뮬: `ros2 launch asw_sim sim.launch.py start:=1` → `ros2 launch asw_bringup drive.launch.py path:=<이름>`
   - 실차: (LIMO) `ros2 launch asw_bringup limo.launch.py` → `ros2 launch asw_bringup drive.launch.py sim:=false viewer:=false`,
     (노트북, ROS_DOMAIN_ID=37) `ros2 run asw_nav nav_viewer`
+- LIMO 단축 명령: `limo_help` (limo_up / limo_drive / limo_view / limo_rec / limo_stop, `src/asw_bringup/limo_env.sh`)
+- **실차 주행 복기**: `limo_drive` 가 `~/asw_bags/<시각>_drive` 로 자동 녹화 → 노트북 `.\scripts\drive_review.ps1`
+  (녹화·주행 CSV·노드 로그를 가져와 `%USERPROFILE%\asw_runs\<이름>\review\report.txt` + map.png. 그래프 --plots, 장면 --frames)
 - WSL 단축 명령: `source scripts/asw_env.sh` 후 `asw_help` (asw_sim, asw_drive, asw_test, asw_plot, asw_path …)
 - 토픽 계약 (시뮬 = 실차): `/cmd_vel`(linear.x m/s, angular.z **요레이트** rad/s), `/odom` + TF odom→base_link
   (출발 위치에서 0,0,0 시작), `/imu`, `/scan`, `/camera/color/image_raw`, `/limo/steering_inner`.
@@ -45,7 +48,13 @@
 ## 드라이버 관련 확인 사항
 - wego `limo_base`는 Ackermann 모드에서 `/odom`을 안 낸다 (publishOdometry에 Ackermann 분기 없음).
   `limo_ackerman_base`는 AckermannDrive(`/limo/ack_cmd`) 입력 + odom 식 오류. → 그래서 `asw_limo_base` 사용
-- 드라이버 상수(신뢰): wheelbase 0.200, track 0.172, 최대 내측 조향 28°, 조향 스케일 2.47
+- 드라이버 상수(신뢰): wheelbase 0.200, track 0.172, 조향 스케일 2.47 (원본 내측 조향 한계 28°)
+- **조향 실측 (2026-11-05, 녹화 3개)**: 섀시가 보고하는 조향(=보낸 값)으로 계산한 곡률의 **0.48배만 실제로 돎** (IMU 기준,
+  각도·속도 무관). 28° 한계면 실제 회전반경 0.96 m. 보내는 한계 **50°** (70° 보내도 섀시 펌웨어가 49.4° 에서 자름) →
+  실제 가운데 조향 24.5°, 최소 반경 0.44 m (마루 0.1 m/s 실측, `MAX_CENTRAL_MEASURED`).
+  `kinematics.CURV_GAIN/HW_MAX_INNER/MAX_CENTRAL/MIN_RADIUS` 가 실측 기준 (드라이버·조종·시뮬·경로 계획 공통).
+  /cmd_vel 요레이트 = 실제 회전, 드라이버가 curv_gain 으로 나눠 더 꺾어 보냄. odom 방향은 **IMU 자이로**(yaw_source 기본 imu,
+  바퀴 모델은 2배로 틀림). 다시 재기: `asw_review <bag> --odom` (조향 실측 표)
 - 카메라·라이다 위치: AgileX 공식 URDF(LIMO `~/limo_ros2_ws/.../limo_ackerman.xacro`, base_link 지면+0.15) 값 =
   카메라 x 0.084 z 0.180 기울기 0, 라이다 x 0.103 z 0.116. 사용자가 줄자로 비슷함 확인 (2026-11-04)
 - 카메라 camera_info (실차): fx=fy 488.33, cx 320.8, cy 213.8, 왜곡 작음(k1 0.062) → hfov 66.5°. 실차 코드는 camera_info 그대로 씀
@@ -53,6 +62,7 @@
   → limo.launch `cam_auto_exposure/cam_exposure/cam_gain/cam_auto_wb/cam_wb` 로 고정 가능
 - 오도메트리: 섀시가 엔코더로 속도를 직접 냄 → 바퀴 지름 불필요. 보정은 `config/limo_calib.yaml`
   (wheel_speed_scale, steer_bias, 녹화 후 `asw_review <bag> --odom`)
+- **카메라 기울기 2.5° 아래** (limo.launch cam_pitch 0.0436, 2026-11-05 녹화로 차로 폭이 40 cm 되게 맞춤. 0° 면 15% 부풀려 보임)
 - **실측 필요**: camera_link 좌우 위치 `cam_y` (차로 가운데에 놓고 녹화 → asw_review '가운데' 0), 오도메트리 보정
 - `limo_driver`의 원본과 다른 점(의도): /cmd_vel 0.5초 끊기면 정지, 50Hz 명령 송신, max_speed 1.0, Ackermann 모드 아니면 구동 안 함
 
