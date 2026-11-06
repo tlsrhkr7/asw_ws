@@ -96,6 +96,10 @@ class PurePursuit(Node):
         p("cone_safety_half_width", 0.13)   # 라바콘 구간 안전 정지 띠 반폭 (차 반폭 0.11 + 2 cm)
         p("lane_centering", True)    # 카메라로 본 실제 차선 가운데로 경로 옮기기
         p("lane_max_shift", 0.10)    # [m]
+        p("lane_curve_radius", 1.2)  # 앞 lane_curve_look 안에 이보다 급한 곳(반경 [m])이 있으면 커브로 봄
+        p("lane_curve_look", 0.8)    # [m]
+        p("lane_curve_max_shift", 0.03)   # 커브에서 차선 맞추기 한계 [m]
+        p("final_lane_centering", True)   # 경로 마지막 전진 구간(주정차 칸 안)에서도 칸 옆 선 보고 가운데로
         p("lane_half", 0.19)         # 차선 가운데 ~ 선 안쪽 가장자리 [m] (차로 400 mm, 선 20 mm)
         p("lane_width", [0.30, 0.48])  # 양쪽 선 안쪽 간격이 이 범위일 때만 차선으로 믿음 [m]
         p("lane_min_points", 8)      # 한쪽 선에 이만큼 점이 있어야 [개]
@@ -110,6 +114,7 @@ class PurePursuit(Node):
         p("stopline_tol", 0.5)       # 맵 기준 정차 위치와 이만큼 [m] 안의 선만 믿음 (넉넉하게)
         p("stopline_max_age", 15.0)  # 이보다 오래된 검출은 버림 [s] (주정차 칸 안에서 앞뒤로 오가는 동안 기억)
         p("stopline_fix_max", 0.30)
+        p("sl_same", 0.10)           # 잡은 정지선과 이 거리 [m] 안의 검출만 같은 선으로
         # 정지선에 다가가며 미리 앞뒤 위치 보정: 정지선이 카메라 앞 approach_range 안에서 approach_confirm 번 연속
         #  (새 검출마다) '맵 남은 거리 − 카메라 남은 거리' 가 approach_agree 안으로 같으면 그 차이만큼 바로 보정.
         #  (기존: 선 앞에 선 뒤에야 보정 → 정지선 직전 커브·판단 위치가 늦게 맞음). 서고 나면 남은 차이를 한 번 더
@@ -120,7 +125,7 @@ class PurePursuit(Node):
         p("end_line_camera", False)  # 칸 끝 노란 가로선 보고 서기: 칸 안은 비슷한 선이 가까이 많아 잘못 잡을 수 있음 →
                                      #  기본 끔 (기동 중 위치 보정 멈춤 + 직전 정지선 보정으로 충분). 실차 칸 보고 다시 판단
         p("end_line_gap", 0.04)      # 경로 마지막(마지막 주정차 칸) 끝: 카메라로 본 노란 가로선 앞 범퍼 여유 [m]
-        p("end_line_tol", 0.15)      # 맵 끝 위치와 이만큼 안의 노란 가로선만 믿음 [m]  # 정지선으로 앞뒤 위치 보정할 최대 [m] (더 크면 뭔가 잘못 → 안 고침)   # 이보다 오래된 검출은 버림 [s]
+        p("end_line_tol", 0.30)      # 맵 끝 위치와 이만큼 안의 노란 가로선만 믿음 [m] (연습 맵 칸이 맵과 10~20 cm 다름)  # 정지선으로 앞뒤 위치 보정할 최대 [m] (더 크면 뭔가 잘못 → 안 고침)   # 이보다 오래된 검출은 버림 [s]
         p("safety_confirm", 0.2)     # 이만큼 [s] 계속 보여야 정지 (순간 잡음으로 섰다 갔다 방지. 0.3 m/s 에서 6 cm)
         p("avoid", True)             # 막혔을 때 비켜 가기
         p("avoid_after", 8.0)        # 안전 정지가 이만큼 [s] 이어지면 (지나가는 사람은 기다림)
@@ -154,6 +159,7 @@ class PurePursuit(Node):
         self.cone_seen_t = -1e9      # 라이다 구간에서 마지막으로 콘·벽을 본 시각 (못 보면 카메라 차선 맞추기로)
         self.line_dt, self.line_res = self.load_line_dt()
         self.sl_obs, self.sl_lock, self.sl_diff, self.stop_count = None, False, None, 0
+        self.sl_lock_obs, self.sl_lock_ref = None, None   # 잡은 정지선 검출 (odom x, y, 시각), 처음 잡은 것
         self.ap_samples, self.ap_done, self.ap_stamp = [], False, None     # 다가가며 미리 보정
         self.end_obs_list, self.end_lock, self.end_cr_obs = [], False, None
         self.create_subscription(PointStamped, "/stopline", self.on_stopline, 10)
@@ -190,6 +196,7 @@ class PurePursuit(Node):
         self.seg, self.idx, self.done = 0, 0, False
         self.wd_last, self.wd_dist = None, 0.0
         self.sl_lock, self.sl_diff, self.end_lock, self.end_cr_obs = False, None, False, None
+        self.sl_lock_obs = None
         self.ap_samples, self.ap_done, self.ap_stamp = [], False, None
         z0 = abs(msg.poses[0].pose.position.z) if msg.poses else 1.0
         now = self.get_clock().now()
@@ -227,11 +234,11 @@ class PurePursuit(Node):
     def approach_fix(self, cr, remain, yaw):
         """정지선에 다가가는 중: 새 검출마다 (맵 남은 거리 − 카메라 남은 거리) 를 모아, 연속으로 같으면 그만큼 앞뒤 보정.
         양수 = 맵 추정보다 실제로 더 와 있음 → 추정 위치를 앞으로."""
-        if not self.g("stopline_approach") or self.ap_done or self.sl_obs is None:
+        if not self.g("stopline_approach") or self.ap_done or self.sl_lock_obs is None:
             return
-        if self.sl_obs[2] == self.ap_stamp:                 # 같은 검출은 한 번만
+        if self.sl_lock_obs[2] == self.ap_stamp:            # 같은 검출은 한 번만 (잡은 선의 새 검출만 들어옴)
             return
-        self.ap_stamp = self.sl_obs[2]
+        self.ap_stamp = self.sl_lock_obs[2]
         lo, hi = self.g("approach_range")
         ahead = cr + self.g("stopline_offset")              # 차 중심 → 선 중심
         if not lo <= ahead <= hi:
@@ -319,11 +326,23 @@ class PurePursuit(Node):
         # 정지선 정차 구간 끝: 카메라로 본 실제 선이 맵 정차 위치와 가까우면 그 선 앞에 섬
         is_stop = d > 0 and self.seg + 1 < len(self.segs) and self.segs[self.seg + 1][3] > self.g("pause")
         if is_stop and self.g("stopline_camera") and remain < 1.3:
-            cr = self.camera_remain()
+            # 한 번 잡은 정지선은 그 선만 따라감: 가까이 가서 선이 카메라 시야(차 앞 ~0.4 m) 밖으로 나가면 그 뒤의 다른
+            #  가로선이 최신 검출이 됨 → 잡은 선과 sl_same 안의 검출만 같은 선으로 (2026-11-06 시뮬: 11번 정지선 20 cm 넘음)
+            new = False
+            if self.sl_lock and self.sl_obs is not None and self.sl_lock_obs is not None:
+                ref = self.sl_lock_ref                       # 처음 잡은 위치 기준 (조금씩 먼 선으로 옮겨 가지 않게)
+                if math.hypot(self.sl_obs[0] - ref[0], self.sl_obs[1] - ref[1]) < self.g("sl_same"):
+                    new = self.sl_obs[2] != self.sl_lock_obs[2]
+                    self.sl_lock_obs = self.sl_obs
+            cr = self.camera_remain(self.sl_lock_obs if self.sl_lock else None)
             if cr is not None and (self.sl_lock or abs(cr - remain) < self.g("stopline_tol")):
                 if not self.sl_lock:
-                    self.sl_lock, self.sl_diff = True, cr - remain
-                self.approach_fix(cr, remain, yaw)
+                    self.sl_lock, self.sl_diff, self.sl_lock_obs, new = True, cr - remain, self.sl_obs, True
+                    self.sl_lock_ref = self.sl_obs
+                    self.get_logger().info(f"정지선 잡음: 카메라로 선까지 {cr + self.g('stopline_offset'):.2f} m, "
+                                           f"맵 정차 위치보다 {(cr - remain) * 100:+.0f} cm")
+                if new:
+                    self.approach_fix(cr, remain, yaw)
                 remain, passed = max(cr, 0.0), cr < 0
         # 경로 마지막 전진 구간(마지막 주정차 칸): 카메라로 본 칸 끝 노란 가로선 앞에 섬 (맵이 몇 cm 틀려도 칸 안에)
         if self.g("end_line_camera") and d > 0 and self.seg == len(self.segs) - 1 and remain < 1.0:
@@ -355,7 +374,7 @@ class PurePursuit(Node):
                 self.pub_stop.publish(String(data=json.dumps(
                     {"n": self.stop_count, "camera": self.sl_lock,
                      "diff": round(self.sl_diff, 3) if self.sl_lock else None}, ensure_ascii=False)))
-            self.sl_obs, self.sl_lock, self.sl_diff = None, False, None
+            self.sl_obs, self.sl_lock, self.sl_diff, self.sl_lock_obs = None, False, None, None
             self.ap_samples, self.ap_done, self.ap_stamp = [], False, None
             self.wd_last, self.wd_dist = None, 0.0
             if self.seg + 1 < len(self.segs):
@@ -381,8 +400,11 @@ class PurePursuit(Node):
                                          < self.g("cone_lost_time"))
             if self.in_cone and not lidar_ok:
                 self.cone_off *= 0.95
+            # 짧은 기동 구간은 보통 차선 맞추기를 쉬지만, 경로 마지막 전진 구간(마지막 주정차 칸 안으로 들어가기)은
+            #  양쪽 칸 선을 보고 가운데로 (2026-11-05 실차: 칸에는 들어갔는데 옆 선 밟음)
+            final_in = self.g("final_lane_centering") and self.seg == len(self.segs) - 1
             self.lane_update(pts, bi, self.g("lane_centering") and not lidar_ok
-                             and seg_len0 >= self.g("maneuver_length"))
+                             and (seg_len0 >= self.g("maneuver_length") or final_in))
             base_off = self.cone_off if lidar_ok else self.lane_off
             self.avoid_progress(rx, ry, yaw)
             pts0, pts = pts, self.shift_path(pts, bi, base_off + self.avoid_off)
@@ -512,9 +534,17 @@ class PurePursuit(Node):
                 if tgt is None:
                     self.lane_off *= 0.95
                 else:
-                    lim = self.g("lane_max_shift")
+                    lim = self.lane_limit(pts, bi)
                     self.lane_off += self.g("lane_alpha") * (max(-lim, min(lim, tgt)) - self.lane_off)
+            lim = self.lane_limit(pts, bi)                 # 커브에 들어서면 이미 옮긴 것도 한계까지 줄임
+            self.lane_off = max(-lim, min(lim, self.lane_off))
         self.pub_lane.publish(Float32(data=float(self.lane_off)))
+
+    def lane_limit(self, pts, bi):
+        """차선 맞추기로 옮길 수 있는 한계: 앞이 급하게 휘면 작게 (커브에서는 선이 휘어 보여 가운데 계산이 치우침,
+        2026-11-05 실차: 커브에서 거의 최대 10 cm 밀고 경로 오차 20 cm)."""
+        k = self.max_curvature(pts, bi, self.g("lane_curve_look"))
+        return self.g("lane_curve_max_shift") if k > 1.0 / self.g("lane_curve_radius") else self.g("lane_max_shift")
 
     def lane_target(self, pts, bi, m):
         if not m.points:

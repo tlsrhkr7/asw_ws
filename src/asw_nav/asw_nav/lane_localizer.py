@@ -95,8 +95,8 @@ class LaneLocalizer(Node):
         p("lost_min_inlier", 0.6)     # 선 2 cm 안 점 비율 이상
         p("lost_min_gain", 0.01)      # 지금보다 이만큼 [m] 이상 나아져야
         p("lost_gain", 0.7)           # 한 번에 반영 비율
-        p("lost_max_step_xy", 0.05)   # [m]
-        p("lost_max_step_yaw", 2.0)   # [deg]
+        p("lost_max_step_xy", 0.02)   # [m] (한 번에 크게 옮기면 경로 오차가 튀어 차가 갑자기 꺾음 → 여러 장에 나눠)
+        p("lost_max_step_yaw", 0.5)   # [deg]
         p("lost_confirm", 2)          # 넓게 찾은 결과가 이만큼 장 연속으로 같은 쪽을 가리킬 때만 반영 (한 장 우연 일치 오탐 방지)
         p("lost_agree_xy", 0.03)      # 연속 결과끼리 이 안이면 같은 쪽 [m]
         p("lost_agree_yaw", 1.5)      # [deg]

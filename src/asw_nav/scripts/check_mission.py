@@ -93,7 +93,7 @@ def main():
 
 
 def stop_gaps(rows, missions_path):
-    """정지선마다 실제로 선 자리: 1초 동안 3 mm 안 움직인 곳 중 선 바로 앞 → 앞 범퍼 ~ 선 중심 [cm] (+ = 선 앞)."""
+    """정지선마다 실제로 선 자리: 1초 동안 3 mm 안 움직인 곳 중 선 바로 앞의 첫 번째 → 앞 범퍼 ~ 선 중심 [cm] (+ = 선 앞)."""
     with open(missions_path, encoding="utf-8") as f:
         mc = yaml.safe_load(f)
     gap0 = mc.get("stop_gap", 0.05)
@@ -109,8 +109,9 @@ def stop_gaps(rows, missions_path):
                 continue
             along = (sl["x"] - x) * math.cos(yaw) + (sl["y"] - y) * math.sin(yaw)
             lat = abs(-(sl["x"] - x) * math.sin(yaw) + (sl["y"] - y) * math.cos(yaw))
-            if lat < 0.3 and -0.1 < along < 0.6 and (best is None or along < best):
-                best = along
+            if lat < 0.3 and -0.1 < along < 0.6:
+                best = along                # 시간상 처음 선 곳 (선 지나 방향 전환으로 잠깐 선 것을 세지 않게)
+                break
         out.append(f"{sl['name']} {(best - 0.161) * 100:+.1f}" if best is not None else f"{sl['name']} 정차 없음")
     print(f"  정지선 앞 범퍼~선 중심 cm (목표 +{gap0 * 100:.0f}, 음수 = 선 넘음): " + ", ".join(out))
 

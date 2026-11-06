@@ -62,6 +62,9 @@
   → limo.launch `cam_auto_exposure/cam_exposure/cam_gain/cam_auto_wb/cam_wb` 로 고정 가능
 - 오도메트리: 섀시가 엔코더로 속도를 직접 냄 → 바퀴 지름 불필요. 보정은 `config/limo_calib.yaml`
   (wheel_speed_scale, steer_bias, 녹화 후 `asw_review <bag> --odom`)
+- **라이다 장착 각도 −9.75°** (URDF `lidar_yaw_real` −0.170, 실차만. 2026-11-06 맵 노란 선 위에 세운 미로 겉벽으로 맞춤:
+  0° 면 벽이 선에서 평균 3.8 cm, 고치면 1.5 cm. 10° 면 1 m 앞 물체가 옆으로 17 cm 밀려 보였음)
+- 도화지 맵 위 실제 최대 가운데 조향은 약 19° (마루 24.5° 보다 작음, 2026-11-05 주행 S4 커브에서 바퀴 49.5° 에 실제 18.8°)
 - **카메라 기울기 2.5° 아래** (limo.launch cam_pitch 0.0436, 2026-11-05 녹화로 차로 폭이 40 cm 되게 맞춤. 0° 면 15% 부풀려 보임)
 - **실측 필요**: camera_link 좌우 위치 `cam_y` (차로 가운데에 놓고 녹화 → asw_review '가운데' 0), 오도메트리 보정
 - `limo_driver`의 원본과 다른 점(의도): /cmd_vel 0.5초 끊기면 정지, 50Hz 명령 송신, max_speed 1.0, Ackermann 모드 아니면 구동 안 함

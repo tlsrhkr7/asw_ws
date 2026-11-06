@@ -41,6 +41,9 @@
   <!-- 센서 장착 (base_link = 지면 기준) -->
   <xacro:property name="lidar_x" value="0.103"/>
   <xacro:property name="lidar_z" value="0.116"/>
+  <!-- 실차 라이다 장착 각도 [rad, + 반시계]: 2026-11-05 녹화, 맵 노란 선 위에 세운 미로 겉벽이 맞도록 찾은 값 −9.75°
+       (0° 면 벽이 선에서 평균 3.8 cm, 고치면 1.5 cm). 시뮬 라이다는 0 (아래 sim 에서) -->
+  <xacro:property name="lidar_yaw_real" value="-0.170"/>
   <xacro:property name="cam_x" value="0.084"/>
   <xacro:property name="cam_z" value="0.180"/>
   <xacro:property name="cam_y" value="0.0"/>   <!-- camera_link(= orbbec 깊이 카메라) 좌우 [m, + 왼쪽]. 실차 컬러 렌즈는
@@ -92,7 +95,7 @@
   </link>
   <joint name="laser_joint" type="fixed">
     <parent link="base_link"/><child link="laser_link"/>
-    <origin xyz="${lidar_x} 0 ${lidar_z}"/>
+    <origin xyz="${lidar_x} 0 ${lidar_z}" rpy="0 0 ${0.0 if sim else lidar_yaw_real}"/>
   </joint>
 
   <link name="camera_link">
