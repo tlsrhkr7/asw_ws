@@ -8,7 +8,7 @@
 기하: 곡률은 뒤차축 점 기준. 목표점 (뒤차축 좌표 xl, yl) 을 지나고 차 진행축에 접하는 원의 곡률 κ = 2·yl / (xl²+yl²).
   요레이트 w = v·κ — v 부호(후진)에 상관없이 성립한다. 조향 한계(내측 28도)는 드라이버가 자른다.
 구간: dir 이 바뀌는 점에서 정지 → pause 초 대기 → 다음 구간.
-안전 정지: 전진 중 '앞으로 갈 경로' 띠(경로 좌우 safety_half_width, 차 앞 safety_dist) 안에 라이다 점이
+안전 정지 (기본 끔 — 영구 정지 = 실격 위험, safety:=true 로만 켬): 전진 중 '앞으로 갈 경로' 띠(경로 좌우 safety_half_width, 차 앞 safety_dist) 안에 라이다 점이
   safety_min_points 개 이상이면 정지, safety_clear 초 동안 비어 있으면 다시 출발 (사람·예상 못한 장애물).
   직선 상자가 아니라 경로를 따라가는 띠 → 곡선·라바콘 구간·옆 차로 장애물에서 헛정지 안 함.
   후진은 라이다(전방 ±110°)로 못 봄 → 후진 구간(주차)은 확인 못 함.
@@ -77,7 +77,8 @@ class PurePursuit(Node):
         p("track_k_lat", 8.0)        # 기동 추종: 횡오차 이득 [1/m^2]
         p("track_k_head", 3.0)       # 방향오차 이득 [1/m]
         p("cmd_topic", "/cmd_vel")
-        p("safety", True)            # 라이다 안전 정지
+        p("stop_count0", 0)          # 정지선 출발 프리셋: 이미 지난 정지선 수 (/pp/stop_event 번호가 이어지게)
+        p("safety", False)           # 라이다 안전 정지 (끔: 막힌 채 서 있으면 실격. 켜면 비켜 가기도 같이 동작)
         p("safety_dist", 0.35)       # 차 앞(범퍼)에서 이만큼 [m] 경로를 따라 확인
         p("safety_half_width", 0.15)  # 경로 좌우 [m] (차 반폭 0.11 + 4 cm). 옆 차로·라바콘·벽(차로 중심에서 ≥ 0.19)은 안 걸림
         p("safety_min_points", 3)    # 잡음 한두 점으로는 안 섬
@@ -86,7 +87,7 @@ class PurePursuit(Node):
         p("cone_zone_dist", 0.15)    # 회색 선(맵)에서 이 거리 안이면 라바콘 구간 [m]
         p("lidar_zones", [1.40, 4.35, 0.35, 2.50])   # 라이다 가운데 맞추기 상자 [x0 x1 y0 y1 ...] (맵의 10 미로 구간)
         p("cone_pre", 0.8)           # 앞으로 갈 경로 이 거리 안이 라바콘 구간이면 미리 시작 [m] (넉넉하게)
-        p("cone_max_shift", 0.12)    # 경로를 옆으로 옮기는 최대 [m]
+        p("cone_max_shift", 0.22)    # 경로를 옆으로 옮기는 최대 [m] (12 → 22 cm, 2026-11-07: 위치 추정이 틀려도 콘 사이로)
         p("cone_gap", 0.21)          # 한쪽 콘만 보일 때 그 콘에서 떨어질 거리 [m] (콘 반지름 포함 차 반폭 + 여유)
         p("cone_look", 1.0)          # 경로 앞 이 거리 안의 콘만 [m]
         p("cone_alpha", 0.3)         # 라이다 한 장마다 반영 비율
@@ -111,9 +112,9 @@ class PurePursuit(Node):
         p("wait_localizer", False)   # true: /localizer/ready (출발 전 자리 맞추기 완료) 까지 출발 안 함
         p("stopline_camera", True)   # 카메라로 찾은 실제 정지선 앞에 서기
         p("stopline_offset", 0.241)  # 차 중심 ~ 선 중심 [m] = 차 반 길이 0.161 + stop_gap 0.08 (missions.yaml 과 같게)
-        p("stopline_tol", 0.5)       # 맵 기준 정차 위치와 이만큼 [m] 안의 선만 믿음 (넉넉하게)
+        p("stopline_tol", 0.8)       # 맵 기준 정차 위치와 이만큼 [m] 안의 선만 믿음 (2026-11-07 실차: 추정이 40~60 cm 뒤처져 보이는 정지선을 버림 → 0.5 → 0.8)
         p("stopline_max_age", 15.0)  # 이보다 오래된 검출은 버림 [s] (주정차 칸 안에서 앞뒤로 오가는 동안 기억)
-        p("stopline_fix_max", 0.30)
+        p("stopline_fix_max", 0.70)  # 정지선으로 앞뒤 위치 바로잡는 최대 [m] (0.3 → 0.7: 뒤처진 만큼 다 고침)
         p("sl_same", 0.10)           # 잡은 정지선과 이 거리 [m] 안의 검출만 같은 선으로
         # 정지선에 다가가며 미리 앞뒤 위치 보정: 정지선이 카메라 앞 approach_range 안에서 approach_confirm 번 연속
         #  (새 검출마다) '맵 남은 거리 − 카메라 남은 거리' 가 approach_agree 안으로 같으면 그 차이만큼 바로 보정.
@@ -158,7 +159,7 @@ class PurePursuit(Node):
         self.cone_off, self.in_cone, self.cone_stamp = 0.0, False, None
         self.cone_seen_t = -1e9      # 라이다 구간에서 마지막으로 콘·벽을 본 시각 (못 보면 카메라 차선 맞추기로)
         self.line_dt, self.line_res = self.load_line_dt()
-        self.sl_obs, self.sl_lock, self.sl_diff, self.stop_count = None, False, None, 0
+        self.sl_obs, self.sl_lock, self.sl_diff, self.stop_count = None, False, None, g("stop_count0")
         self.sl_lock_obs, self.sl_lock_ref = None, None   # 잡은 정지선 검출 (odom x, y, 시각), 처음 잡은 것
         self.ap_samples, self.ap_done, self.ap_stamp = [], False, None     # 다가가며 미리 보정
         self.end_obs_list, self.end_lock, self.end_cr_obs = [], False, None
@@ -458,10 +459,15 @@ class PurePursuit(Node):
         m = self.scan
         if m is None:
             return None
-        try:
-            t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+        try:      # 스캔이 찍힌 순간의 차 위치·방향으로 (회전 중 라이다 점이 같이 돌아가 보이던 것, 2026-11-07)
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time.from_msg(m.header.stamp))
         except Exception:  # noqa: BLE001
-            return None
+            t = None
+        if t is None:
+            try:
+                t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+            except Exception:  # noqa: BLE001
+                return None
         r = np.array(m.ranges, np.float32)
         a = m.angle_min + np.arange(len(r)) * m.angle_increment
         ok = np.isfinite(r) & (r > m.range_min) & (r < max_range)
@@ -549,10 +555,15 @@ class PurePursuit(Node):
     def lane_target(self, pts, bi, m):
         if not m.points:
             return None
-        try:
-            t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+        try:      # 스캔이 찍힌 순간의 차 위치·방향으로 (회전 중 라이다 점이 같이 돌아가 보이던 것, 2026-11-07)
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time.from_msg(m.header.stamp))
         except Exception:  # noqa: BLE001
-            return None
+            t = None
+        if t is None:
+            try:
+                t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+            except Exception:  # noqa: BLE001
+                return None
         yaw = yaw_of(t.transform.rotation)
         c, s_ = math.cos(yaw), math.sin(yaw)
         ox = np.array([q.x for q in m.points])

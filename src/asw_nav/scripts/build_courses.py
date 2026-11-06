@@ -47,7 +47,10 @@ def join(parts):
             gap = 0.0
         nxt = nxt[1:] if gap < 0.01 else nxt
         x, y, d, yaw = nxt[0]
-        nxt[0] = (x, y, 2 if d > 0 else -2, yaw)
+        # 이음매에서 서서 조향 맞추고 출발 (±2). 단 T 주차에서 빠져나와 차로로 이어지는 곳은 전진 → 전진이라
+        #  서지 않고 그대로 이어 감 (2026-11-07 사용자: 빠져나온 뒤 한 번 후진하던 것 없앰, park_t_exit 끝 후진 삭제)
+        if not (p.startswith("route_main:from") and d > 0 and pts[-1][2] > 0):
+            nxt[0] = (x, y, 2 if d > 0 else -2, yaw)
         pts += nxt
     return pts
 

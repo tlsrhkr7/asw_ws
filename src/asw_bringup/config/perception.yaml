@@ -21,3 +21,12 @@
     seam_pad: 0.02
     line_min_len: 0.10     # 선 조각 최소 길이 [m]
     line_max_width: 0.06   # 선 조각 평균 폭 최대 [m]
+    # 나무 바닥 거르기: 맵 밖·빈틈으로 보이는 나무 바닥(판 무늬·흰 코트 선)을 선으로 안 봄 (perception_bev.wood_mask)
+    wood_filter: true
+    wood_h: [5, 26]
+    wood_s_min: 40          # 2026-11-07 녹화: 나무 V 150~255 (바랜 나무는 S 40~80), 어두운 도화지(오탐) V 87~124 → 밝기로 가름
+    wood_v_min: 140
+    wood_open: 0.06
+    wood_close: 0.12
+    wood_min_area: 0.02
+    wood_pad: 0.03

@@ -24,7 +24,35 @@ TOPHAT_KEYS = {
     "seam_pad": 0.02,         # 이음매 양옆 이만큼 [m] 까지 제외
     "line_min_len": 0.10,     # 선 조각 최소 길이 [m] (테이프 반짝임·작은 반사점 제거. 점선 조각은 이보다 김)
     "line_max_width": 0.06,   # 선 조각 평균 폭 최대 [m]
+    # 나무 바닥 거르기 (2026-11-07 연습 맵: 도화지 가장자리·빈틈으로 보이는 체육관 나무 바닥의 판 무늬·흰 코트 선이
+    #  선으로 잡혀 위치 보정 거부). 나무 = 주황~노랑 색이 '넓게' 퍼진 면 → 그 위·바로 옆 선 점은 버림.
+    #  노란 선(2 cm)은 wood_open 보다 가늘어 열림 연산에서 사라지므로 안 걸림. 대회장 매트 밖 나무 바닥에도 씀
+    "wood_filter": False,     # 실차 config/perception.yaml 에서 켬
+    "wood_h": [5, 26],        # 나무 색상 범위 (OpenCV H)
+    "wood_s_min": 40,         # 채도 이상 (바랜 나무 40~80, 진한 나무 87~157)
+    "wood_v_min": 140,        # 밝기 이상 (나무 166~255, 어두운 도화지 87~124)
+    "wood_open": 0.06,        # 이보다 좁은 색 띠(노란 선)는 나무 아님 [m]
+    "wood_close": 0.12,       # 나무 면 안의 흰 코트 선·어두운 판 틈을 메움 [m]
+    "wood_min_area": 0.02,    # 이보다 작은 면은 무시 [m²]
+    "wood_pad": 0.03,         # 나무 면 둘레 이만큼 [m] 도 제외 (종이 끝 경계)
 }
+
+
+def wood_mask(h, s, v, valid, p, res=0.01):
+    """넓게 퍼진 나무색 면 (bool 격자)."""
+    wh = p["wood_h"]
+    w = (valid & (h >= wh[0]) & (h <= wh[1]) & (s > p["wood_s_min"]) & (v > p["wood_v_min"])).astype(np.uint8)
+    ko = max(3, int(round(p["wood_open"] / res)) | 1)
+    w = cv2.morphologyEx(w, cv2.MORPH_OPEN, np.ones((ko, ko), np.uint8))
+    kc = max(3, int(round(p["wood_close"] / res)) | 1)
+    w = cv2.morphologyEx(w, cv2.MORPH_CLOSE, np.ones((kc, kc), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(w, connectivity=8)
+    if n > 1:
+        keep = np.zeros(n, bool)
+        keep[1:] = st[1:, cv2.CC_STAT_AREA] >= p["wood_min_area"] / res / res
+        w = keep[lab].astype(np.uint8)
+    pad = max(1, int(round(p["wood_pad"] / res)))
+    return cv2.dilate(w, np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)) > 0
 
 
 class BirdsEye:
@@ -70,6 +98,8 @@ def tophat_masks(bev_bgr, valid, p, res=0.01, color=None):
         pad = max(1, int(round(p["seam_pad"] / res)))
         seam = cv2.dilate((bh > p["seam_dv"]).astype(np.uint8), np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)) > 0
         inner &= ~seam
+    if p.get("wood_filter"):
+        inner &= ~wood_mask(h, s, v, valid, p, res)
     yh = p["yellow_h"]
     yellow = inner & (h > yh[0]) & (h < yh[1]) & (s > p["yellow_s_min"]) & (th > p["yellow_dv"])
     white = inner & ~yellow & (th > p["white_dv"]) & (s < p["white_s_max_th"])

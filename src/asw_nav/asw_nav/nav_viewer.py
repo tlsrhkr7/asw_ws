@@ -213,10 +213,15 @@ class NavViewer(Node):
         m = self.scan
         if m is None:
             return
-        try:
-            t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+        try:      # 스캔이 찍힌 순간의 차 위치·방향으로 (회전 중 라이다 점이 같이 돌아가 보이던 것, 2026-11-07)
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time.from_msg(m.header.stamp))
         except Exception:  # noqa: BLE001
-            return
+            t = None
+        if t is None:
+            try:
+                t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+            except Exception:  # noqa: BLE001
+                return
         r = np.array(m.ranges, np.float32)
         a = m.angle_min + np.arange(len(r)) * m.angle_increment
         ok = np.isfinite(r) & (r > m.range_min) & (r < min(m.range_max, 8.0))

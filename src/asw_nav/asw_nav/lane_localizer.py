@@ -101,7 +101,16 @@ class LaneLocalizer(Node):
         p("lost_agree_xy", 0.03)      # 연속 결과끼리 이 안이면 같은 쪽 [m]
         p("lost_agree_yaw", 1.5)      # [deg]
         p("occlusion_margin", 0.02)   # 라이다 물체 거리 + 이만큼 보다 먼 카메라 점 제거 [m] (밑동은 남김)
+        p("object_foot", 0.06)        # 라이다 점 이 거리 [m] 안의 카메라 점도 제거 (흰 종이컵·상자 밑동·옆면이 흰 선으로
+                                      #  잡힘, 2026-11-07 실차 라바콘 구간). 0 = 끔. 벽 밑동=선인 미로는 maze_box 안에서 끔
         p("use_lidar_mask", True)
+        # 미로에서만 라이다로도 위치 맞추기: 미로 벽은 맵 노란 선 위에 세움 → 벽에 찍힌 라이다 점을 카메라 선 점과 함께
+        #  같은 맵 매칭에 넣음 (보정 하나로 합침 → 카메라 보정과 따로 놀며 싸우지 않음).
+        #  추정 위치가 maze_box 안일 때만, 그 상자 안에 찍힌 점만 (밖의 사람·물체·다른 구간 벽 제외). 밖에서는 지금과 똑같음
+        p("maze_lidar", True)
+        p("maze_box", [1.40, 4.35, 0.35, 2.50])   # [x0 x1 y0 y1] 맵 10 미로 구간 (pure_pursuit lidar_zones 와 같게)
+        p("maze_lidar_range", 1.5)    # 이 거리 [m] 안 라이다 점만
+        p("maze_lidar_max", 150)      # 라이다 점 최대 개수 (카메라 점보다 너무 많아지지 않게)
         p("map_margin", 0.03)         # 맵 가장자리에서 이만큼 안쪽 점만 사용 [m]
         # 선 색 HSV (OpenCV: H 0~180). 실차 조명에서 다시 맞출 값
         p("yellow_h", [15, 40])
@@ -278,7 +287,21 @@ class LaneLocalizer(Node):
         bins = np.minimum(bins, np.minimum(np.roll(bins, 1), np.roll(bins, -1)))   # 옆 방향 1도까지 여유
         lx, ly = x - t.transform.translation.x, y - t.transform.translation.y
         rb = np.round(np.degrees(np.arctan2(ly, lx))).astype(int) % 360
-        return np.hypot(lx, ly) < bins[rb] + self.g("occlusion_margin")
+        keep = np.hypot(lx, ly) < bins[rb] + self.g("occlusion_margin")
+        foot = self.g("object_foot")
+        if foot > 0 and not self.in_maze_box():
+            near = ok & (r < self.g("range_max") + 0.3)
+            ox, oy = r[near] * np.cos(a[near]), r[near] * np.sin(a[near])          # 라이다 점 (라이다 원점 기준)
+            if len(ox):
+                for k in range(0, len(lx), 400):                                   # 메모리: 400 점씩
+                    d = np.min(np.hypot(lx[k:k + 400, None] - ox[None, :], ly[k:k + 400, None] - oy[None, :]), 1)
+                    keep[k:k + 400] &= d > foot
+        return keep
+
+    def in_maze_box(self):
+        """지금 추정 위치가 미로 상자 안인가 (미로 벽 밑동은 맵 노란 선 자리라 카메라 점을 지우면 안 됨)."""
+        x0, x1, y0, y1 = self.g("maze_box")[:4]
+        return x0 < self.corr_pose[0] < x1 and y0 < self.corr_pose[1] < y1 if getattr(self, "corr_pose", None) else False
 
     # ---------------- 매칭 ----------------
     def match(self):
@@ -302,6 +325,7 @@ class LaneLocalizer(Node):
                 return
         bx, by = tf.transform.translation.x, tf.transform.translation.y
         byaw = yaw_of(tf.transform.rotation)
+        self.corr_pose = (bx, by)
         px, py, lane = self.line_points(msg)
         # 맵(트랙 판) 밖 바닥은 버림: 판 밖 바닥(회색 콘크리트 등)이 회색/흰 선으로 잡히는 것 방지
         c, s_ = math.cos(byaw), math.sin(byaw)
@@ -310,7 +334,9 @@ class LaneLocalizer(Node):
         inside = (wx > mgn) & (wx < SIZE_M - mgn) & (wy > mgn) & (wy < SIZE_M - mgn)
         px, py, lane = px[inside], py[inside], lane[inside]
         self.publish_lane(msg, px[lane], py[lane])
-        if len(px) < self.g("min_points"):
+        lmx, lmy = self.maze_lidar_points(bx, by)
+        self.lidar_n = len(lmx)
+        if len(px) + len(lmx) < self.g("min_points"):
             self.publish_info(float("nan"), float("nan"), len(px), 0.0, 0.0, 0.0, False)
             self.status(f"skip points={len(px)}")
             if init:
@@ -322,6 +348,9 @@ class LaneLocalizer(Node):
         c, s_ = math.cos(byaw), math.sin(byaw)
         mx = bx + c * px - s_ * py                                 # 현재 추정으로 맵에 올린 점
         my = by + s_ * px + c * py
+        if len(lmx):                                               # 미로: 벽에 찍힌 라이다 점도 같이 맞춤
+            mx, my = np.concatenate([mx, lmx]), np.concatenate([my, lmy])
+            px = np.concatenate([px, lmx])                         # (점 개수 표시용)
         # 보정 후보: 차 위치를 중심으로 회전 dth + 평행이동 (dx, dy)
         still_fix = (not init) and self.maneuver and self.still_now() and not self.still_fixed
         if (not init) and self.maneuver and not still_fix:      # 기동 중 움직이는 동안: 보정 쉼
@@ -565,7 +594,37 @@ class LaneLocalizer(Node):
             self.get_logger().warn(f"출발 자리 맞추기 안 됨: {why_ko}")
 
     def status(self, s):
+        if getattr(self, "lidar_n", 0) and not s.startswith("hold"):
+            s += f" lidar={self.lidar_n}"                           # 미로 라이다 점을 같이 쓴 장
         self.pub_status.publish(String(data=s))
+
+    def maze_lidar_points(self, bx, by):
+        """추정 위치가 미로 상자 안이면: 상자 안에 찍힌 라이다 점 (맵 좌표, 스캔 시각의 추정 위치로). 아니면 빈 배열."""
+        e = np.zeros(0, np.float32)
+        x0, x1, y0, y1 = self.g("maze_box")[:4]
+        m = self.scan
+        if not self.g("maze_lidar") or m is None or not (x0 < bx < x1 and y0 < by < y1):
+            return e, e
+        try:
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time.from_msg(m.header.stamp))
+        except Exception:  # noqa: BLE001
+            try:
+                t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+            except Exception:  # noqa: BLE001
+                return e, e
+        r = np.array(m.ranges, np.float32)
+        a = m.angle_min + np.arange(len(r)) * m.angle_increment
+        ok = np.isfinite(r) & (r > m.range_min) & (r < self.g("maze_lidar_range"))
+        r, a = r[ok], a[ok] + yaw_of(t.transform.rotation)
+        x = t.transform.translation.x + r * np.cos(a)
+        y = t.transform.translation.y + r * np.sin(a)
+        k = (x > x0) & (x < x1) & (y > y0) & (y < y1)
+        x, y = x[k].astype(np.float32), y[k].astype(np.float32)
+        n = self.g("maze_lidar_max")
+        if len(x) > n:
+            i = np.linspace(0, len(x) - 1, n).astype(int)
+            x, y = x[i], y[i]
+        return x, y
 
     def publish_lane(self, msg, x, y, n_max=400):
         """차선 점(차 기준) → odom 좌표 PointCloud (영상 시각의 차 위치로)."""

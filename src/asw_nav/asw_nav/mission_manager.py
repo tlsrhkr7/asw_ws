@@ -7,10 +7,9 @@
 
   3 로터리 / 12 마지막 주정차: 해당 정지선에서 멈추면 갈림길 선택지마다 '그 길 경로 띠'(경로 좌우 branch_half_width)
           안의 라이다 점을 여러 번(decide_samples) 세서, 과반이 막힘이면 막힌 길 → 처음으로 열린 길 선택
-  5 추월: 4번 정지선에 서 있는 동안 라이다로 3차로 안 장애물 후보를 모으고, decide_after 초가 지나면 한 번에
-          모든 장애물을 피하는 차로를 정함 (첫 장애물만 보고 성급히 정하지 않음).
-          달리는 동안에도 계속 다시 찾아서(가려졌던 것) 차로를 바꿔야 하면: 옮겨 타기 시작점이 아직 앞이면 그냥
-          다시 계획, 이미 지났으면 그 자리에 서서 '지금 위치 → 새 차로' 로 부드럽게 옮겨 가는 경로로 다시 계획.
+  5 추월: 4번 정지선에 서 있는 동안 도로 안 라이다 점을 칸으로 모으고(여러 장 본 칸 = 장애물, 개수·모양 무관),
+          decide_after 초 뒤 경로 탐색(overtake_plan)으로 모든 칸을 피하는 지그재그 길을 찾음 (세 차로에 다 있어도).
+          달리는 동안 가려졌던 장애물이 새로 보여 지금 길과 겹치면 차 앞부터 다시 계획 (멈추지 않음).
 구간 판단: pure_pursuit 가 정지선에 설 때마다 내는 /pp/stop_event (몇 번째 정지선) 순서로 '지금 어느 정지선'인지 안다
   (missions.yaml stop_lines 순서 = 코스 순서). 위치가 몇 cm 틀려도 순서는 안 틀림. 이벤트가 없으면 맵 거리로 대신 판단.
 경로 전환은 현재 위치에서 이어지는 새 /plan 을 내는 방식 (pure_pursuit 는 새 경로를 받으면 그 점부터 추종).
@@ -48,13 +47,15 @@ class MissionManager(Node):
     def __init__(self):
         super().__init__("mission_manager")
         self.declare_parameter("missions_file", "")
+        self.declare_parameter("start_stops", 0)    # 정지선 출발 프리셋: 이미 지난 정지선 수 (그 정지선에 서 있음)
         cfg_dir = os.path.join(get_package_share_directory("asw_bringup"), "config")
         mf = self.get_parameter("missions_file").value or os.path.join(cfg_dir, "missions.yaml")
         with open(mf, encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
         self.stops = {s["name"]: (s["x"], s["y"]) for s in self.cfg["stop_lines"]}
         self.stop_order = [s["name"] for s in self.cfg["stop_lines"]]     # 코스에서 만나는 순서
-        self.stop_count, self.warned = 0, set()
+        self.start_stops = int(self.get_parameter("start_stops").value)
+        self.stop_count, self.warned = self.start_stops, set()
 
         # 코스 4가지
         c = self.cfg["courses"]
@@ -66,14 +67,15 @@ class MissionManager(Node):
         self.route = dec[0]["options"][0]["route"]
         self.final = dec[1]["options"][0]["final"]
         self.done = set()
-        self.ov_lane = self.cfg["overtake"]["base_lane"]     # 지금 계획된 추월 차로
-        self.ov_seen = []                                   # 확정된 장애물 [(x, y, lane)]
-        self.ov_cand = []                                   # 후보 [x, y, lane, 본 횟수]
-        self.ov_decided = False                             # 정지선에서 차로를 정했나
-        self.ov_start = None                                # 달리다 바꿀 때: (시작 x, 그때 옆 거리)
+        self.ov_seen = []                                   # 확정된 장애물 덩어리 중심 [(x, y)] (화면 표시용)
+        self.ov_hits = {}                                   # 라이다 점 칸 (ix, iy) → 본 장 수
+        self.ov_cells = set()                               # 확정 칸 (confirm 장 이상 본 칸)
+        self.ov_prof = None                                 # 추월 옆 거리 프로파일 (xs, offs) — 가운데 차로 기준
+        self.ov_hitn = 0                                    # 지금 계획이 겹치는 칸 수 (0 = 깨끗)
+        self.ov_decided = False                             # 정지선에서 처음 계획했나
         self.ov_active = False
+        self.ov_planner = self.make_ov_planner()
         self.dec_state = {d["name"]: {} for d in dec}       # 판단 결과 {선택지: "open"|"blocked"}
-        self.ov_blocked = None                              # 추월: 막힌 차로 집합 (찾기 전 None)
         self.part_found = []                                # 라이다로 찾은 칸막이 [(x, y)] (화면 표시용)
         self.dec_acc = {d["name"]: [] for d in dec}         # 판단 표본: [{선택지: (막힘?, 점 수, 중심)}]
         self.dec_runs = {d["name"]: self.decision_runs(d) for d in dec}
@@ -130,10 +132,15 @@ class MissionManager(Node):
         m = self.scan
         if m is None:
             return None
-        try:
-            t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+        try:      # 스캔이 찍힌 순간의 차 위치·방향으로 (회전 중 라이다 점이 같이 돌아가 보이던 것, 2026-11-07)
+            t = self.tfb.lookup_transform("map", m.header.frame_id, Time.from_msg(m.header.stamp))
         except Exception:  # noqa: BLE001
-            return None
+            t = None
+        if t is None:
+            try:
+                t = self.tfb.lookup_transform("map", m.header.frame_id, Time())
+            except Exception:  # noqa: BLE001
+                return None
         r = np.array(m.ranges, np.float32)
         a = m.angle_min + np.arange(len(r)) * m.angle_increment
         ok = np.isfinite(r) & (r > m.range_min) & (r < min(m.range_max, 6.0))
@@ -165,17 +172,35 @@ class MissionManager(Node):
     # ---------------- 경로 ----------------
     def build_plan(self):
         pts = list(self.courses[self.route + self.final])
-        if self.ov_lane != self.cfg["overtake"]["base_lane"] or self.ov_start is not None:
-            pts = self.overtake_path(pts, self.ov_lane, self.ov_start)
+        if self.ov_prof is not None:
+            pts = self.overtake_path(pts, self.ov_prof)
         return pts
 
     def publish(self, pts, start=False, keep_stop=False):
-        """start: 처음 (경로 전체). 아니면 현재 위치에서 이어지는 부분만. keep_stop: 정지선 정차 중이었으면 계속 서 있게."""
+        """start: 처음 (경로 전체, 정지선 출발이면 그 정차 점부터). 아니면 현재 위치에서 이어지는 부분만.
+        keep_stop: 정지선 정차 중이었으면 계속 서 있게."""
+        if start and self.start_stops > 0:
+            marks = [k for k, q in enumerate(pts) if abs(q[2]) > 2.5]       # 정지선 정차 점 (코스 순서)
+            if len(marks) >= self.start_stops:
+                pts = pts[marks[self.start_stops - 1]:]                   # 첫 점 ±3 → 정차 시간만큼 서 있다 출발
+                self.status(f"[출발] 정지선 출발: {self.stop_order[self.start_stops - 1]} 에 서 있는 것으로 시작")
         if not start:
+            # 이미 선 정지선(stop_count 개)의 정차 표시는 지움 + 그 마지막 정지선 앞부분은 버림: 위치를 잃어 추정이
+            #  앞뒤로 틀려도 지난 정지선에 또 서거나(2026-11-07 실차: 4번 정지선에서 추월 계획 낸 뒤 4.5 초 만에 한 번 더
+            #  섬 → 정지선 순서가 하나씩 밀림) 코스 처음으로 돌아가지 않게
+            pts = list(pts)
+            marks = [k for k, q in enumerate(pts) if abs(q[2]) > 2.5]
+            done = min(self.stop_count, len(marks))
+            for k in marks[:done]:
+                x, y, d, yaw = pts[k]
+                pts[k] = (x, y, 1 if d > 0 else -1, yaw)
+            base = marks[done - 1] if done > 0 else 0
             p = self.pose()
             if p is not None:
-                cand = [k for k, q in enumerate(pts)
-                        if abs(wrap(q[3] - p[2])) < math.radians(70) and math.hypot(q[0] - p[0], q[1] - p[1]) < 0.6]
+                cand = [k for k, q in enumerate(pts) if k >= base
+                        and abs(wrap(q[3] - p[2])) < math.radians(70) and math.hypot(q[0] - p[0], q[1] - p[1]) < 0.6]
+                if not cand:
+                    pts = pts[base:]                          # 추정 위치가 경로에서 멀면: 지난 정지선부터
                 if cand:
                     k = min(cand, key=lambda i: math.hypot(pts[i][0] - p[0], pts[i][1] - p[1]))
                     # 바로 앞(0.3 m 안)에 지금 서 있는 정지선 표시가 있으면 거기부터 (짧은 조각 → 한 번 더 정차 방지)
@@ -220,15 +245,12 @@ class MissionManager(Node):
         return res
 
     def overtake_runs(self):
-        """추월 차로마다 지금 장애물 기준으로 옮겨 타는 경로 조각."""
-        o = self.cfg["overtake"]
+        """지금 추월 계획에서 가운데 차로를 벗어나는 경로 조각."""
         base = self.courses[self.route + self.final]
-        lanes = [self.overtake_path(base, k) if k != o["base_lane"] else base for k in range(len(o["lanes_y"]))]
-        diff = np.zeros(len(base), bool)
-        for k, ln in enumerate(lanes):
-            if k != o["base_lane"]:
-                diff |= np.array([abs(p[1] - q[1]) > 1e-4 for p, q in zip(ln, base)])
-        return {k: self.runs(ln, diff) for k, ln in enumerate(lanes)}
+        if self.ov_prof is None:
+            return []
+        ln = self.overtake_path(base, self.ov_prof)
+        return self.runs(ln, np.array([abs(p[1] - q[1]) > 1e-4 for p, q in zip(ln, base)]))
 
     def publish_branches(self):
         items = []
@@ -238,12 +260,11 @@ class MissionManager(Node):
             items.append({"name": d["name"], "options": [
                 {"label": o[key], "chosen": o[key] == cur, "state": self.dec_state[d["name"]].get(o[key], "unknown"),
                  "runs": self.dec_runs[d["name"]][o[key]]} for o in d["options"]]})
-        names = ["top", "mid", "bottom"]
         items.append({"name": "5 추월", "options": [
-            {"label": names[k], "chosen": k == self.ov_lane,
-             "state": "unknown" if self.ov_blocked is None else ("blocked" if k in self.ov_blocked else "open"),
-             "runs": r} for k, r in self.overtake_runs().items()]})
-        det = ([{"x": round(x, 3), "y": round(y, 3), "kind": "obstacle"} for x, y, _ in self.ov_seen]
+            {"label": "plan", "chosen": True,
+             "state": "unknown" if not self.ov_decided else ("open" if self.ov_hitn == 0 else "blocked"),
+             "runs": self.overtake_runs()}]})
+        det = ([{"x": round(x, 3), "y": round(y, 3), "kind": "obstacle"} for x, y in self.ov_seen]
                + [{"x": round(x, 3), "y": round(y, 3), "kind": "partition"} for x, y in self.part_found])
         self.pub_branches.publish(String(data=json.dumps({"items": items, "detections": det})))
 
@@ -297,7 +318,7 @@ class MissionManager(Node):
                     self.part_found.append(tuple(float(x) for x in np.mean(cs, 0)))
             if not b and choice is None:
                 choice = v
-        choice = choice or d["options"][0][key]                     # 둘 다 막힘 → 기본 (안전 정지가 막아 줌)
+        choice = choice or d["options"][0][key]                     # 둘 다 막힘 → 기본 (안전 정지는 기본 꺼짐: 멈추지 않고 감)
         self.done.add(d["name"])
         old = getattr(self, key)
         setattr(self, key, choice)
@@ -308,93 +329,77 @@ class MissionManager(Node):
         self.publish_branches()
 
     # ---------------- 추월 ----------------
+    # 장애물 개수·모양·차로 상관없이: 라이다 점을 칸(cell)으로 모아 confirm 장 이상 본 칸 = 장애물.
+    # 정지선에서 처음 계획하고, 달리면서 새로 확정된 칸이 지금 길과 겹치면 경로 탐색(overtake_plan)으로 다시 계획
+    # (지그재그, 세 차로에 다 흩어져 있어도). 피할 길이 없으면 가장 덜 겹치는 길로 감 (멈추지 않음).
+    def make_ov_planner(self):
+        import cv2
+        from asw_nav.overtake_plan import OvertakePlanner, road_edges_from_map
+        o = self.cfg["overtake"]
+        yc = o["lanes_y"][o["base_lane"]]
+        lo = hi = None
+        try:
+            im = cv2.imread(os.path.join(get_package_share_directory("asw_sim"), "maps", "track_lines_yellow.png"),
+                            cv2.IMREAD_GRAYSCALE)
+            im = cv2.resize(im, (1700, 1700), interpolation=cv2.INTER_AREA) > 0
+            lo, hi = road_edges_from_map(im, 8.5 / 1700, yc)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"추월: 맵 노란 선 못 읽음 ({e}) → 도로 폭 ±0.6 m 로 가정")
+        return OvertakePlanner(yc, o["x_min"], o["x_end"], lo, hi, body_l=o.get("body_l", 0.34),
+                               body_w=o.get("body_w", 0.22), clear=o.get("obstacle_clear", 0.05),
+                               min_radius=o.get("min_radius", 0.6), edge_clear=o.get("edge_clear", 0.03),
+                               lanes=[v - yc for v in o["lanes_y"]])
+
     def detect_overtake(self):
+        """새 라이다 한 장: 추월 구간 도로 안(가장자리 선 안쪽) 점을 칸에 쌓음. 새로 확정된 칸 수 반환."""
         o = self.cfg["overtake"]
         pts = self.scan_points_map()
         if pts is None:
-            return None
-        # 차로 안 점만 (도로 가장자리 밖 사람·벽·관중은 제외): 바깥 차로 중심 ± (차로 반폭 - lane_margin)
+            return 0
+        P = self.ov_planner
         x0, x1 = o["detect_box"][:2]
+        p = pts[(pts[:, 0] > x0) & (pts[:, 0] < x1)]
+        if not len(p):
+            return 0
+        i = np.clip(np.round((p[:, 0] - P.x0) / P.dx).astype(int), 0, len(P.xs) - 1)
+        half = P.body_w / 2 + o.get("edge_clear", 0.03) - o.get("lane_margin", 0.03)   # 옆 거리 한계 → 도로 면
+        lat = p[:, 1] - P.yc
+        p = p[(lat > P.lo[i] - half) & (lat < P.hi[i] + half)]
+        cell = o.get("cell", 0.04)
+        new = 0
+        for c in {(int(round(q[0] / cell)), int(round(q[1] / cell))) for q in p}:
+            self.ov_hits[c] = self.ov_hits.get(c, 0) + 1
+            if self.ov_hits[c] == o.get("confirm", 3):
+                self.ov_cells.add(c)
+                new += 1
+        return new
+
+    def ov_obs(self):
+        cell = self.cfg["overtake"].get("cell", 0.04)
+        return np.array([(i * cell, j * cell) for i, j in self.ov_cells], float).reshape(-1, 2)
+
+    def ov_clusters(self):
+        """확정 칸 → 덩어리 중심 (화면 표시·글). 12 cm 안으로 이어진 칸끼리 한 덩어리."""
+        obs = self.ov_obs()
+        groups = []
+        for q in obs:
+            near = [k for k, g in enumerate(groups) if min(float(np.hypot(*(q - r))) for r in g) < 0.12]
+            merged = [q] + [r for k in near for r in groups[k]]
+            groups = [g for k, g in enumerate(groups) if k not in near] + [merged]
+        return [tuple(float(v) for v in np.mean(g, 0)) for g in groups]
+
+    def overtake_path(self, pts, prof):
+        """추월 구간 점들의 y 를 프로파일 옆 거리만큼 옮기고, 옮긴 점의 차체 방향 = 접선."""
+        o = self.cfg["overtake"]
+        xs, offs = prof
         ly = o["lanes_y"]
-        half = abs(ly[0] - ly[1]) / 2 - o.get("lane_margin", 0.03)
-        y0, y1 = min(ly) - half, max(ly) + half
-        m = (pts[:, 0] > x0) & (pts[:, 0] < x1) & (pts[:, 1] > y0) & (pts[:, 1] < y1)
-        p = pts[m]
-        if len(p) == 0:
-            return []
-        p = p[np.argsort(p[:, 0])]
-        groups, cur = [], [p[0]]
-        for q in p[1:]:
-            if np.hypot(*(q - cur[-1])) < 0.15:
-                cur.append(q)
-            else:
-                groups.append(cur)
-                cur = [q]
-        groups.append(cur)
-        out = []
-        for g in groups:
-            if len(g) >= o.get("min_points", 3):
-                cx, cy = np.mean(g, 0)
-                lane = int(np.argmin([abs(cy - ly) for ly in o["lanes_y"]]))
-                out.append((float(cx), float(cy), lane))
-        return out
-
-    def path_clear(self, pts):
-        """경로가 확인된 추월 장애물 어느 것과도 obstacle_clear 안으로 안 지나가나 (추월 구간 점만)."""
-        o = self.cfg["overtake"]
-        lim = o.get("obstacle_clear", 0.24)            # 차 반폭 0.11 + 컵 덩어리 반폭 ~0.09 + 여유
-        for ox, oy, _ in self.ov_seen:
-            for x, y, d, _ in pts:
-                if d > 0 and abs(x - ox) < 0.6 and math.hypot(x - ox, y - oy) < lim:
-                    return False
-        return True
-
-    def choose_lane(self, obs):
-        o = self.cfg["overtake"]
-        blocked = {lane for _, _, lane in obs}
-        free = [k for k in range(len(o["lanes_y"])) if k not in blocked]
-        if not free:
-            return o["base_lane"]
-        # 가운데에 가까운 차로, 같으면 지금 계획된 차로 유지 (위/아래 흔들림 방지)
-        return min(free, key=lambda k: (abs(k - o["base_lane"]), k != self.ov_lane, k))
-
-    def ov_a0(self):
-        o = self.cfg["overtake"]
-        xs_obs = [x for x, _, _ in self.ov_seen] or [3.8]
-        return max(o["x_min"], min(xs_obs) - o["clear"] - o["change_len"])
-
-    def overtake_path(self, pts, lane, start=None):
-        """추월 구간 점들의 y 를 가운데 차로 → lane → 가운데 로 부드럽게(코사인) 옮긴다.
-        start=(x, 옆 거리): 그 x 에서 그 옆 거리(지금 차 위치)부터 lane 으로 옮겨 감 (달리다 차로를 바꿀 때)."""
-        o = self.cfg["overtake"]
-        ly = o["lanes_y"]
-        A = ly[lane] - ly[o["base_lane"]]
-        xs_obs = [x for x, _, _ in self.ov_seen] or [3.8]
-        L, clr = o["change_len"], o["clear"]
-        a0, A0 = self.ov_a0(), 0.0                               # 옮겨 타기 시작, 시작 옆 거리
-        if start is not None:
-            a0, A0 = start
-        b0 = max(a0 + L, min(o["x_max"] - L, max(xs_obs) + clr))  # 돌아오기 시작
-        y0, y1 = min(ly) - 0.25, max(ly) + 0.25                # 추월 구간 도로 (세 차로)
-
-        def off(x):
-            if x >= b0 + L:
-                return 0.0
-            if x <= a0:
-                return A0
-            if x < a0 + L:
-                return A0 + (A - A0) * (1 - math.cos(math.pi * (x - a0) / L)) / 2
-            if x <= b0:
-                return A
-            return A * (1 + math.cos(math.pi * (x - b0) / L)) / 2
-
+        y0, y1 = min(ly) - 0.25, max(ly) + 0.25
         out = []
         for x, y, d, yaw in pts:
-            if d > 0 and y0 < y < y1 and o["x_min"] - 0.2 < x < o["x_max"] + 0.2 and abs(wrap(yaw)) < math.radians(30):
-                out.append((x, y + off(x), d, yaw))
+            if d > 0 and y0 < y < y1 and xs[0] <= x <= xs[-1] and abs(wrap(yaw)) < math.radians(30):
+                out.append((x, y + float(np.interp(x, xs, offs)), d, yaw))
             else:
                 out.append((x, y, d, yaw))
-        # 바뀐 점의 차체 방향 = 접선
         res = list(out)
         for i in range(1, len(out) - 1):
             if out[i][1] != pts[i][1] or out[i - 1][1] != pts[i - 1][1] or out[i + 1][1] != pts[i + 1][1]:
@@ -402,78 +407,63 @@ class MissionManager(Node):
                 res[i] = (out[i][0], out[i][1], out[i][2], th)
         return res
 
+    @staticmethod
+    def ov_describe(xs, offs):
+        """프로파일 → '가운데 → x3.4 위 → x4.6 아래 → x5.6 가운데' (옆 거리 0.2 m 넘으면 그 쪽 차로로 봄)."""
+        names = {1: "위", 0: "가운데", -1: "아래"}
+        out, cur = [], None
+        for x, v in zip(xs, offs):
+            k = 1 if v > 0.2 else (-1 if v < -0.2 else 0)
+            if k != cur:
+                out.append(names[k] if cur is None else f"x{x:.1f} {names[k]}")
+                cur = k
+        return " → ".join(out)
+
     def update_overtake(self, at_stop):
-        """새 라이다 한 장마다 후보를 모으고, confirm 번 이상 본 것만 장애물로 확정 (한 장 잡음으로 차로를 안 바꿈)."""
+        """새 라이다 한 장마다 칸을 쌓고, 정지선에서 decide_after 초 본 뒤 처음 계획.
+        달리는 중에는 새로 확정된 칸이 지금 길(차 앞쪽)과 겹칠 때만 다시 계획: 차 앞 replan_ahead 뒤의
+        '옆으로 안 움직이는 지점'부터 새로 찾고 그 앞은 지금 길 그대로 (조향이 갑자기 안 바뀌게)."""
         stamp = (self.scan.header.stamp.sec, self.scan.header.stamp.nanosec) if self.scan else None
         if stamp is None or stamp == getattr(self, "ov_stamp", None):
             return
         self.ov_stamp = stamp
-        obs = self.detect_overtake()
-        if obs is None:
-            return
-        for x, y, ln in obs:
-            c = next((c for c in self.ov_cand if math.hypot(x - c[0], y - c[1]) < 0.2), None)
-            if c:
-                k = c[3]
-                c[0], c[1], c[3] = (c[0] * k + x) / (k + 1), (c[1] * k + y) / (k + 1), k + 1
-                c[2] = int(np.argmin([abs(c[1] - v) for v in self.cfg["overtake"]["lanes_y"]]))
-            else:
-                self.ov_cand.append([x, y, ln, 1])
-        confirm = self.cfg["overtake"].get("confirm", 3)
-        new = False
-        for c in self.ov_cand:
-            if c[3] >= confirm and all(math.hypot(c[0] - s[0], c[1] - s[1]) > 0.2 for s in self.ov_seen):
-                self.ov_seen.append((c[0], c[1], c[2]))
-                new = True
-        self.ov_n = getattr(self, "ov_n", 0) + 1
-        if not self.ov_decided:
-            # 정지선에 서 있는 동안은 모으기만, decide_after 초 지나면 (또는 이미 움직이면) 한 번에 결정
-            now = self.get_clock().now().nanoseconds * 1e-9
-            if self.still_since is not None and now - self.still_since < self.cfg["overtake"].get("decide_after", 1.5):
-                return
-            self.ov_decided, new = True, True
-        if not new:
-            if self.ov_blocked is None and self.ov_n >= confirm + 2:     # 몇 장 봐도 없음 → 차로 전부 열림
-                self.ov_blocked = set()
-                self.publish_branches()
-            return
-        lane = self.choose_lane(self.ov_seen)
-        self.ov_blocked = {ln for _, _, ln in self.ov_seen}
-        names = ["위", "가운데", "아래"]
-        desc = ", ".join(f"x{x:.2f} {names[ln]}" for x, _, ln in self.ov_seen)
-        keep, start = False, None
-        p = self.pose()
-        moving = self.still_since is None
+        new = self.detect_overtake()
         o = self.cfg["overtake"]
-        if moving and p is not None and p[0] > self.ov_a0() - 0.15:
-            # 이미 옮겨 타기 시작점을 지남 → 바꾸려면 그 자리에 서서, 지금 위치에서 새 차로로 옮겨 가는 경로
-            start = (p[0], p[1] - o["lanes_y"][o["base_lane"]])
-        # 후보 차로를 선호 순서로 보며, 확인된 장애물과 안 부딪히는 경로만 (없으면 지금 계획 그대로 → 안전 정지가 멈춤)
-        base = self.courses[self.route + self.final]
-        prefer = [lane] + [k for k in sorted(range(len(o["lanes_y"])), key=lambda k: abs(k - o["base_lane"])) if k != lane]
-        pick = None
-        for k in prefer:
-            st = start if (k != self.ov_lane and start is not None) else self.ov_start
-            cand = self.overtake_path(base, k, st) if (k != o["base_lane"] or st is not None) else list(base)
-            if self.path_clear(cand):
-                pick = (k, st)
-                break
-        if pick is None:
-            self.ov_blocked = {ln for _, _, ln in self.ov_seen}
-            self.status(f"[5 추월] 장애물: {desc} → 부딪히지 않고 갈 길 없음, 지금 계획 유지 (막히면 안전 정지)")
-            self.publish_branches()
-            return
-        lane, st = pick
-        if lane == self.ov_lane and st == self.ov_start and self.ov_decided and not new:
-            return
-        if lane != self.ov_lane and st is not None and st is start:
-            keep = True
-            self.status(f"[5 추월] 달리는 중 차로 변경 → 서서 x{p[0]:.2f} 부터 다시 계획")
-        self.ov_start = st
-        self.ov_lane = lane
+        P = self.ov_planner
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if not self.ov_decided:
+            # 서 있으며 decide_after 초 동안 모은 뒤 결정. 모으기 시작한 때부터 잼 (정지선 출발 프리셋은 출발 자리
+            #  맞추는 동안 이미 오래 서 있었음 → 서 있던 시간으로 재면 라이다 한 장만 보고 결정해 버림)
+            self.ov_t0 = getattr(self, "ov_t0", None) or now
+            if self.still_since is not None and now - max(self.still_since, self.ov_t0) < o.get("decide_after", 1.5):
+                return
+            self.ov_decided = True
+            p0 = self.pose()
+            xs, offs, hits = P.plan(self.ov_obs(), view=p0[:2] if p0 else None)
+            keep = self.still_since is not None
+        else:
+            if not new or self.ov_prof is None:
+                return
+            p = self.pose()
+            if p is None:
+                return
+            xs0, offs0 = self.ov_prof
+            if P.collides(xs0, offs0, self.ov_obs(), x_from=p[0]) == 0:
+                return                                            # 새 칸이 있어도 지금 길과 안 겹침
+            # 차 앞 replan_ahead 부터 바로 새로 찾음 (옮겨 타는 중이어도: 기다리면 늦음. 2026-11-07 실차 충돌)
+            ahead = p[0] + o.get("replan_ahead", 0.15)
+            k = int(np.clip(np.searchsorted(xs0, ahead), 0, len(xs0) - 1))
+            xs, offs, hits = P.plan(self.ov_obs(), x_from=xs0[k], o_from=offs0[k], view=p[:2])
+            offs[:k + 1] = offs0[:k + 1]
+            keep = False
+            self.status(f"[5 추월] 달리는 중 새 장애물이 길과 겹침 → x{xs0[k]:.2f} 부터 다시 계획")
+        self.ov_prof, self.ov_hitn = (xs, offs), hits
+        self.ov_seen = self.ov_clusters()
         self.plan = self.build_plan()
         self.publish(self.plan, keep_stop=keep)         # 정차 중이면 pure_pursuit 가 남은 정차 시간 유지
-        self.status(f"[5 추월] 장애물: {desc} → {names[lane]} 차로로 통과")
+        desc = ", ".join(f"x{x:.2f} y{y:.2f}" for x, y in self.ov_seen) or "없음"
+        how = "" if hits == 0 else f" — 완전히 피할 길 없음, 가장 덜 겹치는 길 ({hits}칸, 멈추지 않음)"
+        self.status(f"[5 추월] 장애물 {len(self.ov_seen)}개 ({desc}) → {self.ov_describe(xs, offs)}{how}")
         self.publish_branches()
 
     # ---------------- 주기 ----------------
@@ -488,7 +478,7 @@ class MissionManager(Node):
             self.update_overtake(at_stop=True)
         p = self.pose()
         if self.ov_active and p is not None:
-            if p[0] > o["x_max"]:
+            if p[0] > o["x_end"]:
                 self.ov_active = False
             else:
                 now = self.get_clock().now().nanoseconds * 1e-9

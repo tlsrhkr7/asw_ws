@@ -71,6 +71,9 @@ def load_cfg(path=None, scenario=None):
                 pt[k] = sc_cfg[k]
         if "overtake_seed" in sc_cfg:
             cfg.setdefault("overtake", {})["seed"] = sc_cfg["overtake_seed"]
+        for k in ("count", "mode"):                         # 시험 맵: 추월 장애물 개수·배치 방식
+            if f"overtake_{k}" in sc_cfg:
+                cfg.setdefault("overtake", {})[k] = sc_cfg[f"overtake_{k}"]
     cfg["_scenario"] = sc
     return cfg
 
@@ -83,6 +86,8 @@ def overtake_obstacles(o):
     rng = random.Random(o.get("seed", 0))
     out = []
     count, ly = o.get("count", 2), o["lanes_y"]
+    if o.get("mode") == "scatter":
+        return scatter_obstacles(o, rng)
     if o.get("distinct_lanes", False):
         lanes = rng.sample(range(len(ly)), min(count, len(ly)))
         x0, x1 = o.get("x_window", [3.65, 4.75])
@@ -104,6 +109,49 @@ def overtake_obstacles(o):
             out.append({"kind": "cup", "name": f"ovt{i}_{k}", "x": cx + math.sin(rot[i]) * t,
                         "y": cy + math.cos(rot[i]) * t, "yaw": 0.0, "radius": o.get("radius", 0.03),
                         "height": o.get("height", 0.17), "role": "overtake", "lane": lane, "group": i})
+    return out
+
+
+def scatter_obstacles(o, rng):
+    """시험용 '흩어진' 배치: count 개 컵 덩어리를 scatter_window 안 세 차로에 무작위로, 단
+    (1) 세 차로 모두에 장애물이 있고 (빈 차로 하나로는 못 지나감)
+    (2) 차 크기·회전반경으로 지나갈 길이 있는 배치 (경로 탐색 overtake_plan 을 여유 scatter_clear 로 돌려 확인)
+    만 씀 (seed 마다 같은 배치)."""
+    import cv2
+    import numpy as np
+    from ament_index_python.packages import get_package_share_directory
+    from asw_nav.overtake_plan import OvertakePlanner, road_edges_from_map
+    ly, count = o["lanes_y"], o.get("count", 7)
+    yc = ly[1]
+    im = cv2.imread(os.path.join(get_package_share_directory("asw_sim"), "maps", "track_lines_yellow.png"),
+                    cv2.IMREAD_GRAYSCALE)
+    im = cv2.resize(im, (1700, 1700), interpolation=cv2.INTER_AREA) > 0
+    lo, hi = road_edges_from_map(im, 8.5 / 1700, yc)
+    # 실제 추월 계획기(missions.yaml overtake)와 같은 차 크기·회전반경 + 여유 2 cm 로 '지나갈 수 있는' 배치만
+    P = OvertakePlanner(yc, 2.30, 6.45, lo, hi, body_l=0.42, body_w=0.22, clear=o.get("scatter_clear", 0.09),
+                        min_radius=0.62, lanes=[v - yc for v in ly])
+    n, cgap = o.get("cups_per_obstacle", 3), o.get("cup_gap", 0.06)
+    x0, x1 = o.get("scatter_window", [3.4, 5.5])
+    for _ in range(3000):
+        lanes = [rng.randrange(len(ly)) for _ in range(count)]
+        if len(set(lanes)) < len(ly):
+            continue
+        xs = [rng.uniform(x0, x1) for _ in range(count)]
+        lat = [rng.uniform(-1, 1) * o.get("lateral_jitter", 0.06) for _ in range(count)]
+        groups = [(xs[i], ly[lanes[i]] + lat[i]) for i in range(count)]
+        if any(math.hypot(a[0] - b[0], a[1] - b[1]) < 0.15 for i, a in enumerate(groups) for b in groups[:i]):
+            continue
+        rad = o.get("radius", 0.03)                     # 컵 둘레까지 (중심점만 보면 3 cm 빠듯한 배치가 나옴)
+        pts = np.array([(cx + dx, cy + (k - (n - 1) / 2) * cgap + dy) for cx, cy in groups for k in range(n)
+                        for dx, dy in ((0, 0), (rad, 0), (-rad, 0), (0, rad), (0, -rad))])
+        if P.plan(pts)[2] == 0:
+            break
+    out = []
+    for i, (cx, cy) in enumerate(groups):
+        for k in range(n):
+            out.append({"kind": "cup", "name": f"ovt{i}_{k}", "x": cx, "y": cy + (k - (n - 1) / 2) * cgap, "yaw": 0.0,
+                        "radius": o.get("radius", 0.03), "height": o.get("height", 0.17), "role": "overtake",
+                        "lane": lanes[i], "group": i})
     return out
 
 

@@ -29,6 +29,9 @@ scenarios:
   2: {rotary_blocked: bottom, final_blocked: right, overtake_seed: 5}
   3: {rotary_blocked: top,    final_blocked: left,  overtake_seed: 22}
   4: {rotary_blocked: top,    final_blocked: right, overtake_seed: 8}
+  # 시험 맵: 추월 구간에 컵 덩어리 7개를 세 차로에 흩어 놓음 (빈 차로 없음, 차 크기로 지그재그 길은 있는 배치)
+  5: {rotary_blocked: bottom, final_blocked: left,  overtake_seed: 3,  overtake_count: 7, overtake_mode: scatter}
+  6: {rotary_blocked: top,    final_blocked: right, overtake_seed: 11, overtake_count: 7, overtake_mode: scatter}
 
 # 칸막이 (신호등 대신, 2025 변경 규정): 동전 던지기로 막을 쪽을 정함 → 차는 안 막힌 쪽으로 주행
 #   3 로터리:      top = 원 위로 도는 길 막음 / bottom = 원 아래로 가는 길 막음 / none

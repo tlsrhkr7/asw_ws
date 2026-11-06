@@ -21,13 +21,14 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 sys.path.insert(0, get_package_share_directory("asw_bringup"))
-from asw_bringup_util import start_pose  # noqa: E402
+from asw_bringup_util import start_pose, start_stops  # noqa: E402
 
 
 def nodes(context):
     lc = lambda n: LaunchConfiguration(n).perform(context)  # noqa: E731
     sim = lc("sim").lower() == "true"
     x, y, yaw = start_pose(lc("start"), lc("x"), lc("y"), lc("yaw"))
+    stops0 = start_stops(lc("start"))     # 정지선 출발 프리셋(S2 …): 그 정지선에 서 있는 것으로 시작
     common = {"use_sim_time": sim}
     # 카메라 색 기준: 실차는 config/perception.yaml (현장에서 분석 창으로 맞춘 값). 시뮬은 렌더링 색이 달라 코드 기본값
     perc = [os.path.join(get_package_share_directory("asw_bringup"), "config", "perception.yaml")] if not sim else []
@@ -45,7 +46,8 @@ def nodes(context):
                      parameters=[common]))
     # 경로: mission:=true 면 미션 관리자(코스 4가지 중 칸막이 보고 선택 + 추월 회피), 아니면 path 파일 하나 그대로
     mission = lc("mission").lower() == "true"
-    planner = (Node(package="asw_nav", executable="mission_manager", output="screen", parameters=[common])
+    planner = (Node(package="asw_nav", executable="mission_manager", output="screen",
+                    parameters=[common, {"start_stops": stops0}])
                if mission else
                Node(package="asw_nav", executable="path_publisher", output="screen",
                     parameters=[common, {"path": lc("path")}]))
@@ -72,6 +74,7 @@ def nodes(context):
              parameters=[common, {"speed": float(lc("speed")), "reverse_speed": float(lc("reverse_speed")),
                                   "lookahead_min": float(lc("lookahead")), "wait_localizer": init_align,
                                   "lane_centering": lc("lane_centering").lower() == "true",
+                                  "safety": lc("safety").lower() == "true", "stop_count0": stops0,
                                   # 마지막 주정차 칸 끝 노란 선 보고 서기: 기본 끔 (2026-11-05 시뮬: 우회전 칸에서 엉뚱한 선 잡아
                                   #  26 cm 일찍 섬. 실차 깊이는 맞음 → 필요할 때만 end_line_camera:=true)
                                   "end_line_camera": lc("end_line_camera") == "true"}]),
@@ -104,6 +107,8 @@ def generate_launch_description():
         DeclareLaunchArgument("end_line_camera", default_value="false", description="칸 끝 노란 선 보고 서기"),
         DeclareLaunchArgument("lane_centering", default_value="true",
                               description="카메라로 본 실제 차선 가운데로 경로 옮기기 (맵이 실제와 다를 때)"),
+        DeclareLaunchArgument("safety", default_value="false",
+                              description="라이다 안전 정지(+막혔을 때 비켜 가기). 기본 끔: 서 있으면 실격 위험"),
         DeclareLaunchArgument("init_align", default_value="true",
                               description="출발 전 카메라로 놓인 자리 맞추기 (끝날 때까지 출발 안 함). false: 프리셋 그대로 출발"),
         DeclareLaunchArgument("record", default_value="auto", description="auto: 실차만 녹화 | true | false"),

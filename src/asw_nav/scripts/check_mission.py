@@ -66,7 +66,7 @@ def main():
 
     def lane_change(x, y):
         """추월 구간 차로 사이 흰선 = 차로 변경 (정상)."""
-        return ov["x_min"] - 0.3 < x < ov["x_max"] + 0.3 and min(ly) - 0.05 < y < max(ly) + 0.05
+        return ov["x_min"] - 0.3 < x < ov.get("x_end", ov.get("x_max", 6.45)) + 0.3 and min(ly) - 0.05 < y < max(ly) + 0.05
 
     events = []       # [종류, 이름, t0, t1, x, y, n]
     for r in rows:
