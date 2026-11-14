@@ -37,6 +37,15 @@ class StoplineDetector(Node):
         super().__init__("stopline_detector")
         p = self.declare_parameter
         p("rate", 15.0)
+        p("sl_seam_filter", True)     # 정지선 검출에 검은 이음매 걸러내기 (켬, 여유는 sl_seam_pad 로 좁게)
+        p("sl_seam_pad", 0.01)        # 이음매 옆 이만큼 [m] 까지만 지움. 2026-11-11 실차 녹화 비교:
+                                      #  끔 → 테이프 위 반사광을 8번 정지선으로 오인 (41 cm 앞에서 섬),
+                                      #  2 cm(위치 보정과 같은 값) → 이음매 옆 4번 정지선을 못 봄, 1 cm → 둘 다 맞음
+        p("sl_line_max_width", 0.06)  # 정지선 검출만: 선 조각 평균 폭 최대 [m]. 0.10 으로 넓히면 커브 뒤 번진 정지선을 더
+                                      #  잘 보지만 (녹화 3개: 6·8·11번 더 많이), 2026-11-12 실차에서 2번 정지선 61 cm 앞 검은 테이프
+                                      #  가장자리 반사광(물결 모양, 넓은 조각)을 먼저 잡아 그 앞에 섬 → 0.06 으로 되돌림
+        p("max_gap", perception.LINE_KEYS["max_gap"])   # 띠 안에서 이보다 길게 끊긴 가로선(점선)은 정지선 아님 [m]
+        p("sl_yellow_reject", 0.3)    # 흰 가로선 자리 좌우를 노란 점이 이 비율 넘게 덮으면 노란 선으로 보고 버림 (0 = 끔)
         p("range_min", 0.30)          # 카메라가 보는 바닥 [m] (차 중심 기준 앞)
         p("range_max", 1.20)
         p("band_half", 0.15)          # 차로 가운데 이 폭 [m] 안의 점만 (정지선은 차로를 가로질러 그어짐)
@@ -84,6 +93,13 @@ class StoplineDetector(Node):
         img = np.ascontiguousarray(ground_proj.image_bgr(msg))
         if self.g("detect") == "tophat":
             p = {k: self.g(k) for k in list(perception.COLOR_KEYS) + list(perception_bev.TOPHAT_KEYS)}
+            # 정지선: '검은 이음매 위·옆 밝은 점 버리기'를 좁게 (1 cm). 넓으면 이음매 바로 옆 4번 정지선이 지워지고
+            #  (2026-11-07), 끄면 이음매 테이프 위 반사광이 정지선으로 잡힘 (2026-11-11)
+            p["line_max_width"] = self.g("sl_line_max_width")
+            if not self.g("sl_seam_filter"):
+                p["seam_dv"] = 0
+            else:
+                p["seam_pad"] = self.g("sl_seam_pad")
             white, yellow, _, _ = perception_bev.tophat_masks(self.be.warp(img), self.be.valid, p)
             pts = {0: perception_bev.points(self.be, white), 1: perception_bev.points(self.be, yellow)}
         else:
@@ -95,6 +111,17 @@ class StoplineDetector(Node):
         t = None
         for color, (px_, py_) in pts.items():
             found = self.find_line(px_, py_)
+            if found is not None and color == 0 and self.g("sl_yellow_reject") > 0:
+                # 흰 가로선인데 같은 자리 좌우를 노란 점이 덮으면 노란 선(멀리서 바래 일부가 흰색으로 잡힘) → 정지선 아님
+                #  (2026-11-13 대회장: T 줄기에서 나와 돌며 정면으로 본 아래 노란 경계선을 미로 앞 정지선으로 잡음)
+                yx, yy = pts[1]
+                dist_, ang_ = found
+                hb = self.g("band_half")
+                xr = yx * math.cos(ang_) + yy * math.sin(ang_)
+                k = (np.abs(yy) < hb) & (np.abs(xr - dist_) < 0.04)
+                cov = len(np.unique(np.round(yy[k] / 0.01))) / (2 * hb / 0.01)
+                if cov > self.g("sl_yellow_reject"):
+                    found = None
             if found is None:
                 self.prev[color] = None
                 continue

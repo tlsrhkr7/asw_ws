@@ -121,6 +121,8 @@ class NavViewer(Node):
         self.plan, self.pose, self.gt = [], None, None
         self.loc_pts, self.loc_info, self.loc_t, self.info_t = None, None, 0.0, 0.0
         self.create_subscription(Path, "/plan", self.on_plan, latched)
+        self.corr_pts, self.corr_t = [], 0.0       # 콘 통로 가운데 선 (pure_pursuit /cone/corridor)
+        self.create_subscription(Path, "/cone/corridor", self.on_corridor, 5)
         self.branches, self.detections = [], []
         self.create_subscription(String, "/mission/branches", self.on_branches, latched)
         self.init_msg, self.init_t = "", 0.0
@@ -159,6 +161,10 @@ class NavViewer(Node):
         with self.lock:
             self.plan = [(p.pose.position.x, p.pose.position.y, 1 if p.pose.position.z >= 0 else -1)
                          for p in msg.poses]
+
+    def on_corridor(self, msg):
+        with self.lock:
+            self.corr_pts, self.corr_t = [(p.pose.position.x, p.pose.position.y) for p in msg.poses], time.time()
 
     def on_init(self, msg):
         with self.lock:
@@ -278,6 +284,11 @@ class NavViewer(Node):
             cv2.line(img, self.w2p(xa, ya), self.w2p(xb, yb), (60, 200, 60) if d > 0 else (0, 140, 255), 3, cv2.LINE_AA)
         if plan:
             cv2.circle(img, self.w2p(*plan[-1][:2]), 7, (60, 200, 60), 2, cv2.LINE_AA)
+        with self.lock:
+            corr, corr_age = list(self.corr_pts), time.time() - self.corr_t
+        if corr and corr_age < 1.0:              # 콘 통로 가운데 선 (라이다로 만든 것, 하늘색) — 이걸 따라감
+            for (xa, ya), (xb, yb) in zip(corr, corr[1:]):
+                cv2.line(img, self.w2p(xa, ya), self.w2p(xb, yb), (255, 255, 0), 3, cv2.LINE_AA)
         for dt in dets:                         # 미션 관리자가 라이다로 찾은 것
             r = max(8, int((0.12 if dt["kind"] == "obstacle" else 0.25) * self.view_s))
             cv2.circle(img, self.w2p(dt["x"], dt["y"]), r, (40, 40, 255), 2, cv2.LINE_AA)
@@ -294,7 +305,10 @@ class NavViewer(Node):
             self.draw_start_guide(img)
         else:
             self.draw_init(img)
-            self.draw_loc_status(img)
+            try:                                    # 상태 글 그리기 오류로 창 전체가 죽지 않게
+                self.draw_loc_status(img)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warn(f"위치 상태 글 그리기 실패: {e}", throttle_duration_sec=5.0)
         if pose:
             self.car(img, pose, (255, 200, 0), fill=True)
         return img
@@ -318,6 +332,13 @@ class NavViewer(Node):
         if now - self.recover_t < 2.0:
             t, col = "위치 다시 찾음! (넓게 찾아서 맞춤)", (80, 255, 120)
         elif s.startswith("LOST"):
+            # 한 번도 맞춘 적 없이 놓침(출발 차로 모드 처음 등)이면 since 가 없음 → 상태 글의 초를 씀
+            #  (2026-11-13 대회장: None 을 숫자로 찍으려다 네비 창이 죽음)
+            if since is None:
+                try:
+                    since = float(s.split()[1].rstrip("s"))
+                except (IndexError, ValueError):
+                    since = 0.0
             t, col = f"위치 잃음 {since:.0f}초째 → 넓게 찾는 중 (파란 상자가 실제 차와 어긋났을 수 있음)", (60, 60, 255)
         elif since is not None and since < 1.0:
             t, col = "위치 보정 중: 카메라 선이 맵과 맞음", (80, 255, 120)

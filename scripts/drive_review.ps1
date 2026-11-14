@@ -22,6 +22,7 @@ T=$(stat -c %Y "$B")
 S=$(date -d "$(echo $N | sed -E 's/^([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2}).*/\1-\2-\3 \4:\5:\6/')" +%s)
 rm -rf /tmp/asw_review && mkdir -p /tmp/asw_review/$N/logs
 cp -r "$B" /tmp/asw_review/$N/
+[ -d "${B}_cpu" ] && cp -r "${B}_cpu" /tmp/asw_review/$N/cpu
 for f in $(ls ~/asw_logs/run_*_mission.csv 2>/dev/null); do [ $(stat -c %Y "$f") -ge $S ] && cp "$f" /tmp/asw_review/$N/; done
 for f in $(ls ~/.ros/log/*.log 2>/dev/null); do [ $(stat -c %Y "$f") -ge $S ] && cp "$f" /tmp/asw_review/$N/logs/; done
 cd /tmp/asw_review && tar czf /tmp/asw_review.tgz $N

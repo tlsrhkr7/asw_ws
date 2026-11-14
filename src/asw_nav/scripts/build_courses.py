@@ -3,7 +3,8 @@
 
   course_<route><final>: route B(원 아래)/T(원 위) × final L(위칸 좌회전)/R(아래칸 우회전)
     = 차로 경로(처음 ~ 주차 시작점) + T 후진 주차 + 빠져나오기 + 차로 경로(합류점 ~ 끝) + 마지막 회전 정차
-  정지선 (missions.yaml stop_lines): 경로가 선을 지나기 직전, 앞 범퍼가 선 stop_gap 앞인 점을 dir ±3 (정지선 정차)
+  정지선 (missions.yaml stop_lines): 경로가 선을 지나기 직전, 앞 범퍼가 선 stop_gap 앞인 점을 dir ±3 (정지선 정차).
+    pass = 같은 선을 몇 번째 지날 때, mode before_reverse = 선 앞에서 후진으로 바뀌는 점을 ±4 (정차, 카메라 위치 조정 없음)
   기존 이름 호환: course_left = course_BL, course_right = course_BR
 """
 import math
@@ -61,10 +62,32 @@ def mark_stops(pts, stop_lines, gap):
     out = list(pts)
     marked = []
     for sl in stop_lines:
-        i = min(range(len(out)), key=lambda k: (out[k][0] - sl["x"]) ** 2 + (out[k][1] - sl["y"]) ** 2)
-        dmin = math.dist(out[i][:2], (sl["x"], sl["y"]))
-        if dmin > 0.15:
-            continue                                    # 이 코스는 그 정지선을 안 지남
+        if sl.get("mode") == "before_reverse":
+            # 선을 넘지 않고 그 앞에서 후진으로 바뀌는 경로 (T 주차 줄기 끝): 바뀌는 점에서 stop_wait 정차 (±4 = 카메라로
+            #  정차 위치 안 옮김 → T 주차 기준 경로 그대로)
+            ks = [k for k in range(len(out) - 1) if out[k][2] > 0 and out[k + 1][2] < 0
+                  and math.dist(out[k][:2], (sl["x"], sl["y"])) < 0.45]
+            if not ks:
+                continue
+            k = min(ks, key=lambda q: math.dist(out[q][:2], (sl["x"], sl["y"])))
+            xx, yy, _, yw = out[k + 1]
+            out[k + 1] = (xx, yy, -4, yw)
+            marked.append(f"{sl['name']}@{xx:.2f},{yy:.2f}(후진 전)")
+            continue
+        dist = [math.dist(q[:2], (sl["x"], sl["y"])) for q in out]
+        near = [k for k, d_ in enumerate(dist) if d_ < 0.15]
+        passes, cur = [], []
+        for k in near:                                  # 선 근처를 지나는 덩어리 = 한 번 지남
+            if cur and k - cur[-1] > 3:
+                passes.append(cur)
+                cur = []
+            cur.append(k)
+        if cur:
+            passes.append(cur)
+        n = sl.get("pass", 1)
+        if len(passes) < n:
+            continue                                    # 이 코스는 그 정지선을 (n 번째로) 안 지남
+        i = min(passes[n - 1], key=lambda k: dist[k])
         # 선 중심을 경로에 수직 투영한 위치(누적 거리)에서 정확히 back 만큼 앞에 보간한 점을 넣음
         #  (경로 점 간격 단위로 세면 한 칸씩 일찍 서서 맵 기준 정차가 7~13 cm 일렀음)
         s = [0.0]

@@ -34,8 +34,8 @@ def main():
     r.open(rosbag2_py.StorageOptions(uri=a.bag, storage_id="sqlite3"), rosbag2_py.ConverterOptions("cdr", "cdr"))
     types = {t.name: t.type for t in r.get_all_topics_and_types()}
     want = {"/tf", "/tf_static", "/scan", "/camera/color/image_jpeg", "/localizer/points", "/plan", "/cmd_vel",
-            "/localizer/status", "/mission/status"}
-    mo, ob, scans, imgs, lpts, plans, st, ms, lstat = [], [], [], [], [], [], {}, [], []
+            "/localizer/status", "/mission/status", "/cone/corridor", "/mission/branches"}
+    mo, ob, scans, imgs, lpts, plans, st, ms, lstat, corrs, dets = [], [], [], [], [], [], {}, [], [], [], []
     t0 = None
     while r.has_next():
         tp, d, t = r.read_next()
@@ -55,6 +55,12 @@ def main():
             lpts.append((t, np.array(m.data).reshape(-1, 2)))
         elif tp == "/plan":
             plans.append((t, np.array([(p.pose.position.x, p.pose.position.y) for p in m.poses])))
+        elif tp == "/mission/branches":
+            import json as _json
+            j = _json.loads(m.data)
+            dets.append((t, [(o["x"], o["y"]) for o in j.get("detections", []) if o.get("kind") == "obstacle"]))
+        elif tp == "/cone/corridor":
+            corrs.append((t, np.array([(p.pose.position.x, p.pose.position.y) for p in m.poses]).reshape(-1, 2)))
         elif tp == "/localizer/status":
             lstat.append((t, m.data))
         elif tp == "/mission/status":
@@ -110,6 +116,15 @@ def main():
         if pl is not None and len(pl[1]):
             u, v = px(pl[1][:, 0], pl[1][:, 1])
             cv2.polylines(can, [np.stack([u, v], 1).astype(np.int32)], False, (80, 200, 80), 2)
+        dt_ = latest(dets, t)                   # 미션이 확정한 추월 장애물 (빨간 원)
+        if dt_ is not None:
+            for qx, qy in dt_[1]:
+                u, v = px([qx], [qy])
+                cv2.circle(can, (int(u[0]), int(v[0])), 12, (0, 0, 255), 2)
+        cr = latest(corrs, t)                  # 콘 통로 가운데 선 (하늘색, 1초 안 것만)
+        if cr is not None and t - cr[0] < 1.0 and len(cr[1]) > 1:
+            u, v = px(cr[1][:, 0], cr[1][:, 1])
+            cv2.polylines(can, [np.stack([u, v], 1).astype(np.int32)], False, (255, 255, 0), 3)
         sc = latest(scans, t)
         if sc is not None:
             m = sc[1]

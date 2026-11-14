@@ -1,8 +1,8 @@
 # LIMO 실차 단축 명령 (deploy 로 ~/asw_ws/src/asw_bringup/limo_env.sh 에 올라감, ~/.bashrc 가 source)
 #   limo_help            명령 목록
 #   limo_up              [터미널 1] 섀시 + 라이다 + 카메라 (조향 한계 45°, odom 방향 IMU, 카메라 기울기 2.5°)
-#   limo_drive [인자]    [터미널 2] 자율주행 미션 + 디버그 창 (기본 start:=1 speed:=0.15)   ← 차 주변 확인 후!
-#                        예) limo_drive speed:=0.2   /  limo_drive start:=2
+#   limo_drive [인자]    [터미널 2] 자율주행 미션, 화면 없음 — 화면은 viewer:=true 또는 limo_view (기본 start:=1 speed:=0.95 tight_speed:=0.5 curve_speed:=0.6 stop_slow_speed:=0.55)   ← 차 주변 확인 후!
+#                        예) limo_drive speed:=0.5 tight_speed:=0.2   /  limo_drive start:=S4  (2026-11-13 실차: 0.95/0.5/0.6 완주)
 #   limo_view            디버그 창만 따로 (주행은 이미 떠 있을 때)
 #   limo_rec [이름]      수동 조종하며 녹화 (limo_up 대신 이것만, 조종 창 클릭 후 WASD)   ← 차 주변 확인 후!
 #   limo_stop            떠 있는 launch 전부 끄기 (차 정지)
@@ -17,7 +17,7 @@ _limo_src() {
 }
 limo_help()  { sed -n '2,12p' ~/asw_ws/src/asw_bringup/limo_env.sh; }
 limo_up()    { _limo_src; ros2 launch asw_bringup limo.launch.py "$@"; }
-limo_drive() { _limo_src; ros2 launch asw_bringup drive.launch.py sim:=false viewer:=true mission:=true start:=1 speed:=0.15 "$@"; }
+limo_drive() { _limo_src; ros2 launch asw_bringup drive.launch.py sim:=false viewer:=false mission:=true start:=1 speed:=0.95 tight_speed:=0.5 curve_speed:=0.6 stop_slow_speed:=0.55 "$@"; }
 limo_view()  { _limo_src; ros2 run asw_nav nav_viewer "$@"; }
 limo_rec()   { _limo_src; ros2 launch asw_bringup record.launch.py ${1:+name:=$1} "${@:2}"; }
 limo_stop()  { pkill -INT -f "ros2 launch asw_bringup" && echo "launch 끄는 중 (차 정지)" || echo "떠 있는 launch 없음"; }

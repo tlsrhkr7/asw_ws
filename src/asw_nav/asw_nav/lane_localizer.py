@@ -72,8 +72,16 @@ class LaneLocalizer(Node):
         p("still_search_yaw", 3.0)    # [deg]
         p("still_max_cost", 0.015)    # 이만큼 잘 맞을 때만 [m]
         p("still_min_inlier", 0.7)
+        # 기동(주차 칸 안 전진·후진) 끝나고 서 있을 때 한 번 넓게 다시 맞추기: 기동 동안 쌓인 오차(2026-11-13 대회장 T 주차
+        #  19 초 → 앞뒤 23 cm·옆 5 cm·2°)를 꺾어 나가기 전에 고침 (pure_pursuit 가 그 사이 resume_wait 초 서 있음)
+        p("resume_fix", True)
+        p("resume_search_xy", 0.30)   # [m]
+        p("resume_search_yaw", 6.0)   # [deg]
+        p("resume_max_cost", 0.015)   # 이만큼 잘 맞을 때만 [m]
+        p("resume_min_inlier", 0.7)
         p("max_step_xy", 0.01)        # 한 번에 옮기는 위치 최대 [m] (10 Hz → 10 cm/s: 잘못 맞춘 선이 차를 따라
         p("max_step_yaw", 0.3)        #  위치를 끌고 가는 것보다 차가 빠르게) / 방향 최대 [deg]
+                                      #  (0.05 로 줄여 봤더니 시뮬(자이로 오차 넣음) 맵 4 에서 방향을 못 따라가 망가짐 → 그대로)
         p("search_xy", 0.08)          # [m]
         p("search_yaw", 4.0)          # [deg]
         p("max_dist", 0.05)           # 맵 선까지 거리 자르기 [m]
@@ -125,6 +133,11 @@ class LaneLocalizer(Node):
             p(k, "hsv" if k == "detect" else val)
         # 출발 전 자리 맞추기
         p("init_align", True)
+        # 출발 차로 아무 데서나 출발 (2026-11-13 대회장 규정: 출발 차로를 아래로 늘려 어디든 놓음 → 앞뒤 위치 모름):
+        #  첫 정지선에서 위치를 잡을 때까지(/localizer/shift 첫 수신) 맵 맞추기를 쉬고 차선 점만 냄 (pure_pursuit 차선 주행).
+        #  start_lane_timeout 초가 지나도 정지선으로 못 잡으면 맵 맞추기 다시 시작
+        p("start_lane", False)
+        p("start_lane_timeout", 40.0)
         p("init_search_xy", 0.12)     # [m]
         p("init_max_shift", 0.08)     # 프리셋에서 이보다 많이 옮겨야 맞으면 출발 안 함 [m] (옆 차선 착각 방지)
         p("init_max_turn", 8.0)       # [deg]
@@ -176,14 +189,16 @@ class LaneLocalizer(Node):
         self.scan = None
         self.create_subscription(LaserScan, "/scan", lambda m_: setattr(self, "scan", m_), qos_profile_sensor_data)
         self.create_subscription(CameraInfo, "/camera/color/camera_info", self.on_info, 5)
-        self.create_subscription(Vector3, "/localizer/shift", self.on_shift, 10)
+        self.create_subscription(Vector3, "/localizer/shift", self.on_shift_start, 10)
+        self.start_lane_on, self.start_lane_t0 = bool(g("start_lane")), None
         # 디버그 창(nav_viewer)에서: 출발 자리 손으로 맞추기 (맵 좌표 dx, dy [m], z = dyaw [rad]) / 지금 자리로 출발
         self.create_subscription(Vector3, "/localizer/nudge", self.on_nudge, 10)
         self.create_subscription(Bool, "/localizer/force_start", self.on_force_start, 10)
         self.maneuver = False
         self.speed, self.still_since, self.still_fixed = 0.0, None, False
         self.create_subscription(Odometry, "/odom", self.on_odom, 20)
-        self.create_subscription(Bool, "/pp/maneuver", lambda m_: setattr(self, "maneuver", m_.data), 10)
+        self.create_subscription(Bool, "/pp/maneuver", self.on_maneuver, 10)
+        self.resume_t = None                  # 기동이 막 끝난 시각 (넓게 다시 맞추기 대기)
         self.create_subscription(Image, "/camera/color/image_raw", lambda m_: setattr(self, "img", m_),
                                  qos_profile_sensor_data)
         self.create_timer(0.02, self.publish_tf)                   # map→odom 50 Hz
@@ -327,6 +342,15 @@ class LaneLocalizer(Node):
         byaw = yaw_of(tf.transform.rotation)
         self.corr_pose = (bx, by)
         px, py, lane = self.line_points(msg)
+        if self.start_lane_on:
+            now_ = self.get_clock().now().nanoseconds * 1e-9
+            self.start_lane_t0 = self.start_lane_t0 or now_
+            if now_ - self.start_lane_t0 < self.g("start_lane_timeout"):
+                self.publish_lane(msg, px[lane], py[lane])          # 앞뒤 위치를 모르니 맵 밖 거르기 없이 차선 점만
+                self.status("hold (출발 차로: 첫 정지선까지 차선 주행)")
+                return
+            self.start_lane_on = False
+            self.get_logger().warn("출발 차로: 정지선으로 위치를 못 잡음 → 맵 맞추기 다시 시작")
         # 맵(트랙 판) 밖 바닥은 버림: 판 밖 바닥(회색 콘크리트 등)이 회색/흰 선으로 잡히는 것 방지
         c, s_ = math.cos(byaw), math.sin(byaw)
         mgn = self.g("map_margin")
@@ -353,19 +377,28 @@ class LaneLocalizer(Node):
             px = np.concatenate([px, lmx])                         # (점 개수 표시용)
         # 보정 후보: 차 위치를 중심으로 회전 dth + 평행이동 (dx, dy)
         still_fix = (not init) and self.maneuver and self.still_now() and not self.still_fixed
+        now_ = self.get_clock().now().nanoseconds * 1e-9
+        if self.resume_t is not None and (self.maneuver or now_ - self.resume_t > 2.5):
+            self.resume_t = None                                 # 다시 기동 중이거나 늦음 → 안 함
+        resume = (not init) and not self.maneuver and self.resume_t is not None and self.still_now(0.3)
         if (not init) and self.maneuver and not still_fix:      # 기동 중 움직이는 동안: 보정 쉼
             self.status("hold (기동 중)")
             return
         now = self.get_clock().now().nanoseconds * 1e-9
         if self.last_ok_t is None:
             self.last_ok_t = now
-        lost = (not init and not still_fix and self.g("lost_recovery")
+        lost = (not init and not still_fix and not resume and self.g("lost_recovery")
                 and now - self.last_ok_t > self.g("lost_after"))
         step = 0.01
         if init:
             sx, syaw = self.g("init_search_xy"), math.radians(self.g("init_search_yaw"))
         elif still_fix:
             sx, syaw = self.g("still_search_xy"), math.radians(self.g("still_search_yaw"))
+        elif resume:
+            sx, syaw, step = self.g("resume_search_xy"), math.radians(self.g("resume_search_yaw")), 0.02
+            if len(mx) > 400:
+                k = np.random.default_rng(1).choice(len(mx), 400, replace=False)
+                mx, my = mx[k], my[k]
         elif lost:
             sx, syaw, step = self.g("lost_search_xy"), math.radians(self.g("lost_search_yaw")), 0.02
             if len(mx) > 400:                                  # 넓게 찾을 땐 점을 줄여 계산량 맞춤
@@ -373,7 +406,7 @@ class LaneLocalizer(Node):
                 mx, my = mx[k], my[k]
         else:
             sx, syaw = self.g("search_xy"), math.radians(self.g("search_yaw"))
-        pen_w = self.g("init_penalty") if init else (0.02 if lost else self.g("penalty"))
+        pen_w = self.g("init_penalty") if init else (0.02 if (lost or resume) else self.g("penalty"))
         dxy = np.arange(-sx, sx + 1e-9, step)
         dths = np.arange(-syaw, syaw + 1e-9, math.radians(1.0))
         best = (1e9, 0.0, 0.0, 0.0)
@@ -410,6 +443,19 @@ class LaneLocalizer(Node):
         if init:
             self.publish_info(base, cost, len(px), ddx, ddy, dth, False)
             self.init_step(bx, by, ddx, ddy, dth, cost, inlier, len(px))
+            return
+        if resume:                                               # 기동 끝 정지: 넓게 찾아 아주 잘 맞으면 한 번에
+            if cost <= self.g("resume_max_cost") and inlier >= self.g("resume_min_inlier") and base - cost > 0.002:
+                self.resume_t = None
+                self.publish_info(base, cost, len(px), ddx, ddy, dth, True)
+                self.apply(bx, by, ddx, ddy, dth, 1.0)
+                self.last_ok_t = now
+                self.status(f"resume-fix dx={ddx * 100:+.1f}cm dy={ddy * 100:+.1f}cm dyaw={math.degrees(dth):+.1f}deg "
+                            f"cost {cost * 100:.1f}cm inlier={inlier:.0%}")
+                self.get_logger().info(f"기동 끝 다시 맞춤: x {ddx * 100:+.1f} y {ddy * 100:+.1f} cm, {math.degrees(dth):+.1f}°")
+            else:
+                self.publish_info(base, base, len(px), 0.0, 0.0, 0.0, False)
+                self.status(f"resume-try cost={cost * 100:.1f}cm inlier={inlier:.0%}")
             return
         if still_fix:                                            # 기동 중 멈춤: 아주 잘 맞으면 한 번에
             self.still_fixed = True
@@ -492,8 +538,19 @@ class LaneLocalizer(Node):
         else:
             self.still_since, self.still_fixed = None, False
 
+    def on_maneuver(self, m):
+        if self.maneuver and not m.data and self.g("resume_fix"):
+            self.resume_t = self.get_clock().now().nanoseconds * 1e-9
+        self.maneuver = m.data
+
     def still_now(self, hold=0.4):
         return self.still_since is not None and self.get_clock().now().nanoseconds * 1e-9 - self.still_since > hold
+
+    def on_shift_start(self, m):
+        if self.start_lane_on:
+            self.start_lane_on = False
+            self.get_logger().info("출발 차로: 첫 정지선으로 앞뒤 위치 잡음 → 맵 맞추기 시작")
+        self.on_shift(m)
 
     def on_shift(self, m):
         """다른 노드가 확인한 위치 보정 (정지선 앞 정차 → 앞뒤): 차 추정 위치를 맵에서 (x, y) 만큼 옮김."""

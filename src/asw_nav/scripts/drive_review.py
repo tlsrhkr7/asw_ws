@@ -55,10 +55,98 @@ def read_bag(path):
         elif topic == "/battery":
             out[topic].append((t, m.voltage))
         elif topic == "/odom":
-            out[topic].append((t, m.pose.pose.position.x, m.pose.pose.position.y))
+            q = m.pose.pose.orientation
+            out[topic].append((t, m.pose.pose.position.x, m.pose.pose.position.y,
+                               math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))))
         elif hasattr(m, "data"):
             out[topic].append((t, m.data))
     return out
+
+
+def _proc_name(cmd):
+    """top -c 명령줄 → 짧은 이름 (python3 .../lane_localizer → lane_localizer, ros2 bag record → ros2 bag)."""
+    if not cmd:
+        return "?"
+    name = os.path.basename(cmd[0])
+    rest = [c for c in cmd[1:] if not c.startswith("-")]
+    if name.startswith("python") and rest:
+        name = os.path.basename(rest[0])
+        if name == "ros2" and len(rest) > 1:
+            name += " " + rest[1]
+    elif name == "bash" and rest:
+        name = os.path.basename(rest[0])
+    return name[:40]
+
+
+def cpu_report(d, B, t_start, t_end, rel):
+    """메시지 멈춤(/odom 끊김) + CPU 기록(<주행>/cpu/top.log, tegrastats.log: limo_drive 가 남김) 요약."""
+    L = ["", "## 메시지 멈춤·CPU", ""]
+    od = [q[0] for q in B["/odom"] if t_start <= q[0] <= t_end]
+    gaps = [(a, b - a) for a, b in zip(od, od[1:]) if b - a > 0.2]
+    L.append(f"- /odom (50 Hz) 0.2초 넘게 끊김 {len(gaps)}번" + (f", 최대 {max(g for _, g in gaps):.2f}초" if gaps else "")
+             + "  (정상 주행은 0번. 많으면 LIMO 전체가 멈칫한 것 → 위치가 묵어 조향이 늦음)")
+    top_p = os.path.join(d, "cpu", "top.log")
+    if not os.path.exists(top_p):
+        L.append("- CPU 기록 없음 (2026-11-13 이후 limo_drive 녹화부터 남음)")
+        return L
+    blocks, cur = [], None
+    for ln in open(top_p, encoding="utf-8", errors="replace"):
+        if ln.startswith("T "):
+            cur = {"t": float(ln.split()[1]), "busy": None, "procs": []}
+            blocks.append(cur)
+        elif cur is None:
+            continue
+        elif ln.startswith("%Cpu"):
+            m = re.search(r"([\d.]+)\s*id", ln)
+            cur["busy"] = 100 - float(m.group(1)) if m else None
+        else:
+            f = ln.split()
+            if len(f) >= 12 and f[0].isdigit():
+                try:
+                    cur["procs"].append((float(f[8]), _proc_name(f[11:])))
+                except ValueError:
+                    pass
+    blocks = [b for b in blocks if t_start <= b["t"] <= t_end]
+    if not blocks:
+        L.append("- CPU 기록이 주행 시간과 안 겹침")
+        return L
+    busy = [b["busy"] for b in blocks if b["busy"] is not None]
+    L.append(f"- 전체 CPU 사용 % (6코어 모두 꽉 = 100): 평균 {np.mean(busy):.0f}, 최대 {max(busy):.0f}")
+    per = {}
+    for k, b in enumerate(blocks):
+        for c, n in b["procs"]:                            # 같은 이름은 한 시각 안에서 더함
+            per.setdefault(n, [0.0] * len(blocks))[k] += c
+    rows = sorted(per.items(), key=lambda kv: -sum(kv[1]))[:8]
+    L.append("- 프로세스별 %CPU (100 = 코어 하나 꽉, 파이썬 노드는 100 근처면 혼자 버거움):")
+    for n, v in rows:
+        L.append(f"    {n:40s} 평균 {sum(v) / len(blocks):5.0f}  최대 {max(v):5.0f}")
+    for a, g in sorted(gaps, key=lambda x: -x[1])[:5]:
+        b = min(blocks, key=lambda q: abs(q["t"] - a))
+        L.append(f"- 끊김 {rel(a):6.1f}s ({g:.2f}초): 그때 전체 {b['busy'] or 0:.0f}%, "
+                 + ", ".join(f"{n.split()[0]} {c:.0f}" for c, n in sorted(b["procs"], reverse=True)[:5]))
+    tg = os.path.join(d, "cpu", "tegrastats.log")
+    if os.path.exists(tg):
+        loads, freqs, temps = [], [], []
+        for ln in open(tg, encoding="utf-8", errors="replace"):
+            try:
+                t = float(ln.split()[0])
+            except (ValueError, IndexError):
+                continue
+            if not t_start <= t <= t_end:
+                continue
+            m = re.search(r"CPU \[([^\]]*)\]", ln)
+            if m:
+                cs = [re.match(r"(\d+)%@(\d+)", c) for c in m.group(1).split(",")]
+                cs = [c for c in cs if c]
+                loads.append(max(int(c.group(1)) for c in cs))
+                freqs += [int(c.group(2)) for c in cs]
+            m = re.search(r"tj@([\d.]+)C", ln)
+            if m:
+                temps.append(float(m.group(1)))
+        if loads:
+            L.append(f"- tegrastats: 가장 바쁜 코어 평균 {np.mean(loads):.0f}% 최대 {max(loads)}%, 클럭 {min(freqs)}~{max(freqs)} MHz"
+                     + (f", 칩 온도 최대 {max(temps):.0f}°C" if temps else ""))
+    return L
 
 
 def read_logs(d):
@@ -236,6 +324,21 @@ def main():
         col = (60, 220, 60) if g < 1.0 else (0, 150, 255) if g < 3.0 else (40, 40, 255)
         cv2.line(img, w2p(a[1], a[2]), w2p(b[1], b[2]), col, 4)
 
+    # odom(바퀴 + IMU)만으로 갔다면: 출발 순간의 추정 위치에 odom 을 그대로 이어 붙인 길 (카메라 보정 없음) — 자홍 가는 선
+    od = B["/odom"]
+    if traj and od:
+        ot = [q[0] for q in od]
+        j0 = min(max(bisect.bisect_left([q[0] for q in traj], t_start), 0), len(traj) - 1)   # 출발 순간 (자리 맞춤 끝난 뒤)
+        k = min(max(bisect.bisect_left(ot, traj[j0][0]), 0), len(od) - 1)
+        x0, y0, a0 = traj[j0][1], traj[j0][2], traj[j0][3]
+        ox, oy, oa = od[k][1], od[k][2], od[k][3]
+        da = a0 - oa
+        c, s_ = math.cos(da), math.sin(da)
+        dr = [(x0 + c * (q[1] - ox) - s_ * (q[2] - oy), y0 + s_ * (q[1] - ox) + c * (q[2] - oy)) for q in od[k::5]]
+        for a, b in zip(dr, dr[1:]):
+            cv2.line(img, w2p(*a), w2p(*b), (255, 0, 255), 2)
+        B["_deadreck"] = dr
+
     def pose_at(t):
         if not traj:
             return None
@@ -265,6 +368,8 @@ def main():
         cv2.drawMarker(img, w2p(worst_cte[2], worst_cte[3]), (0, 0, 255), cv2.MARKER_DIAMOND, 26, 3)
     cv2.putText(img, "green: camera fix <1s  orange: 1-3s  red: >3s (lost)   S#=stop  star=recover  L#=lost start  "
                      "X(magenta)=safety stop  diamond=max cte", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+    cv2.putText(img, "thin magenta line = odom only (wheel + IMU, no camera correction)", (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
     cv2.imwrite(os.path.join(out, "map.png"), cv2.resize(img, (800, 800), interpolation=cv2.INTER_AREA))
     if args.plots:
         plots(out, B, cmd, traj, rel, since_ok, t_start, t_end, recovers, safety)
@@ -402,6 +507,7 @@ def write_report(out, bag_path, B, traj, st, n_by, lost_eps, events, safety, don
         prev, cnt, first, last_msg = key, 1, t, msg
     L += ["", "그림: map.png (초록 = 1초 안 카메라 보정, 주황 = 1~3초 못 함, 빨강 = 3초 넘게 / S# 정지선, 별 = 다시 찾음, "
           "L# 위치 잃음 시작, 자홍 X = 안전 정지, 마름모 = cte 최대)"] + (["frames: " + ", ".join(frames)] if frames else [])
+    L += cpu_report(os.path.dirname(out), B, t_start, t_end, rel)
     open(os.path.join(out, "report.txt"), "w", encoding="utf-8").write("\n".join(L) + "\n")
     print("\n".join(L))
     print(f"\n보고서: {out}/report.txt, map.png")

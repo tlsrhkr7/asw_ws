@@ -15,7 +15,17 @@ COLOR_KEYS = {
 LINE_KEYS = {
     "range_min": 0.30, "range_max": 1.20, "band_half": 0.15, "band_thick": 0.04,
     "min_coverage": 0.6, "max_angle": 25.0,
+    # 좌우 띠 안에서 이보다 길게 끊긴 가로선은 버림 [m] (점선). 2026-11-13 대회장: 로터리·T 입구에 잘못 그은 흰 점선
+    #  (선 ~10 cm / 빈칸 ~10 cm → 덮음 50~67 % 라 덮음 기준만으로는 통과할 수 있음). 진짜 정지선은 검은 이음매가
+    #  지나도 4~6 cm 만 끊김
+    "max_gap": 0.07,
 }
+
+
+def _max_gap(row):
+    """덮인 칸(bool) 들 사이 가장 긴 빈 칸 수 (양 끝 바깥은 안 셈)."""
+    k = np.nonzero(row)[0]
+    return int(np.max(np.diff(k)) - 1) if len(k) > 1 else 0
 
 
 def color_masks(h, s, v, p):
@@ -42,7 +52,7 @@ def find_line(x, y, p):
     lo = p["range_min"]
     nb = int((p["range_max"] - lo) / 0.01) + 1
     w = max(1, int(round(th / 0.01)))
-    best = None
+    cands = []
     for ang in np.radians(np.arange(-p["max_angle"], p["max_angle"] + 1e-9, 2.0)):
         xr = x * math.cos(ang) + y * math.sin(ang)           # 선에 수직인 축으로 본 거리
         xb = np.clip(((xr - lo) / 0.01).astype(int), 0, nb - 1)
@@ -53,16 +63,27 @@ def find_line(x, y, p):
             cum[k:k + nb] |= occ
         cov = cum[:nb].mean(axis=1)
         hit = np.where(cov >= p["min_coverage"])[0]
+        if p.get("max_gap", 0) > 0:                      # 점선(띠 안에서 길게 끊김) 빼고 가장 가까운 것
+            mg = int(round(p["max_gap"] / 0.01))
+            hit = np.array([i for i in hit if _max_gap(cum[i]) <= mg], int)
         if len(hit) and abs(ang) < math.radians(p["max_angle"]) - 1e-6:   # 각도 한계에 붙은 건 비스듬한 옆 선
             i = hit[0]                                       # 두께 창 [i-w+1, i] 안에 선이 있음
             a0, a1 = lo + (i - w + 1) * 0.01, lo + (i + w + 1) * 0.01
             s2 = (xr >= a0) & (xr < a1)
             d = float(np.median(xr[s2])) if s2.any() else lo + i * 0.01   # 그 근처 흰 점 가운데 = 선 중심
             c = float(cov[i:i + w].max())
-            # 가장 가까운 선 중에서 좌우를 가장 잘 덮는 각도 (= 선과 맞는 각도)의 거리
-            if best is None or d < best[0] - 0.05 or (abs(d - best[0]) <= 0.05 and c > best[1]):
-                best = (d, c, float(ang))
-    return (best[0], best[2], best[1]) if best else None
+            cands.append((d, c, float(ang)))
+    if not cands:
+        return None
+    # 가장 가까운 선(가장 가까운 후보에서 0.15 m 안)의 후보 중 좌우를 가장 잘 덮는 각도들 → 그 가운데 각도.
+    #  예전: 5 cm 넘게 가까우면 우선 → 비스듬히 돌린 축으로 잰 거리는 늘 짧아(거리 × cos) 덮음이 낮은 비스듬한 해석을
+    #  골랐음 (2026-11-12 실차: 정지선 0.96 m 를 23° 로 0.89 m → 정지선 13 cm 앞에 서고 위치 보정도 그만큼 틀림)
+    dmin = min(c[0] for c in cands)
+    near = [c for c in cands if c[0] < dmin + 0.15]
+    cmax = max(c[1] for c in near)
+    top = sorted((c for c in near if c[1] >= cmax - 0.03), key=lambda c: c[2])
+    d, c, ang = top[len(top) // 2]
+    return d, ang, c
 
 
 def lane_check(x, y, width=(0.30, 0.48), look=(0.35, 1.00), step=0.05, n_min=2, half=0.19):
