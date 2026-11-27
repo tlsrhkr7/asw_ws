@@ -27,8 +27,6 @@
 - LIMO 단축 명령: `limo_help` (limo_up / limo_drive / limo_view / limo_rec / limo_stop, `src/asw_bringup/limo_env.sh`)
 - **실차 주행 복기**: `limo_drive` 가 `~/asw_bags/<시각>_drive` 로 자동 녹화 → 노트북 `.\scripts\drive_review.ps1`
   (녹화·주행 CSV·노드 로그를 가져와 `%USERPROFILE%\asw_runs\<이름>\review\report.txt` + map.png. 그래프 --plots, 장면 --frames)
-- **현장 점검**: `limo_rec venue` 로 출발 자리에서 수동 한 바퀴 → 노트북 `.\scripts\venue_check.ps1` (-Start S4 등)
-  (위치 보정·정지선 검출을 녹화에 다시 돌려 위치 놓침·가짜 선·차로 폭→cam_pitch·정지선 5개·라이다 각도·물체 보이는 거리·칸막이 판단·조향 실측 → `asw_runs\<이름>\venue\report.txt` + overview.png + caps\)
 - WSL 단축 명령: `source scripts/asw_env.sh` 후 `asw_help` (asw_sim, asw_drive, asw_test, asw_plot, asw_path …)
 - 토픽 계약 (시뮬 = 실차): `/cmd_vel`(linear.x m/s, angular.z **요레이트** rad/s), `/odom` + TF odom→base_link
   (출발 위치에서 0,0,0 시작), `/imu`, `/scan`, `/camera/color/image_raw`, `/limo/steering_inner`.
@@ -42,7 +40,6 @@
 3. 실행·토픽 확인·로그는 `ssh -o HostKeyAlias=limo limo "..."`. 긴 실행은 `timeout 20 ...`.
 4. **모터를 움직일 수 있는 것(`/cmd_vel` 발행, limo.launch/drive.launch 실행, 섀시 시리얼 쓰기)은 사용자가 차량 주변을 확인했다고 말한 뒤에만.**
    상태만 볼 때는 `scripts/limo_serial_peek.py`(읽기 전용).
-5. wego_ws의 `teleop_launch.py`와 `limo.launch.py`를 동시에 띄우지 않는다 (같은 시리얼/센서).
 6. **미리 아는 정보는 평면 트랙 맵뿐.** 칸막이·장애물·라바콘·사람 위치와 차 위치는 모름 → 라이다/카메라로 판단.
    `objects.yaml`은 시뮬에 소품을 놓는 용도만 (주행·판단·네비 화면에 쓰지 않음). 실차 확인 목록: `docs/real_car_checklist.md`
 7. 큰 파일(rosbag, 데이터셋)은 커밋하지 않는다. 모델 `.pt`는 `models/`, 50MB 넘으면 Git LFS.

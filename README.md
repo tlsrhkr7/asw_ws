@@ -5,9 +5,19 @@ IROC 2026 국제로봇콘테스트 자율주행 1/10 ASW Racer 부문 **1위, �
 AgileX LIMO Pro (Jetson, Ackermann) 위에서 ROS 2 Humble로 만든 지도 기반 자율주행 SW입니다. 8.5 m 트랙에서 차선 주행, 로터리 칸막이 판단, 장애물 추월, 라바콘, T자 후진 주차, 미로, 주정차를 한 번에 수행합니다.
 
 ## 영상
-- [본선 주행 (대구 EXCO)](https://youtu.be/1QIsqIilS5k)
-- [연습 트랙 주행 (학교 체육관에 재현한 트랙)](https://youtu.be/lmc6cI81Qr8)
-- [Gazebo 시뮬레이션 전체 코스](https://youtube.com/shorts/_guo_zX5014)
+
+### 본선 주행 (대구 EXCO, 1위)
+https://github.com/user-attachments/assets/3def0678-0bd1-43bf-9cef-30a627500049
+
+### 연습 트랙 (학교 체육관에 재현한 트랙)
+https://github.com/user-attachments/assets/9c1e660c-63ad-402d-a527-5f6a110969ba
+
+### Gazebo 시뮬레이션 전체 코스
+https://github.com/user-attachments/assets/22b3bf13-b99f-4b2f-bfe0-9ed605bf5568
+
+고화질: [본선 주행](https://youtu.be/1QIsqIilS5k) | [연습 트랙](https://youtu.be/lmc6cI81Qr8) | [Gazebo 시뮬레이션](https://youtube.com/shorts/_guo_zX5014) (YouTube)
+
+보도: [IROC 2026 시상식](https://youtu.be/T9jLKFSvSCE?t=2115) | [KBS대구 라디오 현장 인터뷰](https://youtu.be/P73pccafmdI?t=219)
 
 ## 접근
 - 대회장 트랙 연습이 하루뿐이라, 대회장 맵을 Gazebo에 옮겨 전체 코스를 먼저 완성하고 실차에서는 시뮬레이터와의 차이만 측정해 보정했습니다.
